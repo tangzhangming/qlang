@@ -1,0 +1,3756 @@
+//! 虚拟机实现
+//! 
+//! 执行字节码指令
+
+use crate::compiler::{Chunk, OpCode};
+use crate::i18n::{Locale, format_message, messages};
+use super::value::{Value, Iterator, IteratorSource, StructInstance, Function};
+use std::rc::Rc;
+use std::cell::RefCell;
+
+/// 栈大小
+const STACK_SIZE: usize = 256;
+
+/// 最大调用深度
+const MAX_FRAMES: usize = 64;
+
+/// 运行时错误
+#[derive(Debug, Clone)]
+pub struct RuntimeError {
+    pub message: String,
+    pub line: usize,
+}
+
+impl RuntimeError {
+    fn new(message: String, line: usize) -> Self {
+        Self { message, line }
+    }
+}
+
+/// 调用帧（优化：使用 Copy 而非 Clone）
+#[derive(Debug, Clone, Copy)]
+struct CallFrame {
+    /// 返回地址（调用后继续执行的位置）
+    return_ip: u32,
+    /// 栈基址（参数和局部变量的起始位置）
+    base_slot: u16,
+    /// 是否是方法调用（影响返回时的栈截断位置）
+    is_method_call: bool,
+    // 注意：移除了 func 字段，因为大多数情况下不需要
+}
+
+/// 异常处理器
+#[derive(Debug)]
+struct ExceptionHandler {
+    /// catch 块的地址
+    catch_ip: usize,
+    /// 设置处理器时的栈深度
+    stack_depth: usize,
+    /// 设置处理器时的调用帧深度
+    frame_depth: usize,
+}
+
+/// 虚拟机
+pub struct VM {
+    /// 字节码块
+    chunk: Chunk,
+    /// 指令指针
+    ip: usize,
+    /// 值栈
+    stack: Vec<Value>,
+    /// 调用栈
+    frames: Vec<CallFrame>,
+    /// 异常处理器栈
+    exception_handlers: Vec<ExceptionHandler>,
+    /// 当前语言
+    locale: Locale,
+    /// 当前栈基址（缓存，避免每次访问 frames.last()）
+    current_base: usize,
+}
+
+impl VM {
+    /// 创建新的虚拟机
+    pub fn new(chunk: Chunk, locale: Locale) -> Self {
+        Self {
+            chunk,
+            ip: 0,
+            stack: Vec::with_capacity(STACK_SIZE),
+            frames: Vec::with_capacity(MAX_FRAMES),
+            exception_handlers: Vec::new(),
+            locale,
+            current_base: 0,
+        }
+    }
+
+    /// 运行字节码
+    /// 
+    /// 使用直接 u8 匹配优化热路径指令，避免 OpCode::from() 转换开销
+    pub fn run(&mut self) -> Result<(), RuntimeError> {
+        // 热路径 opcode 常量（避免每次转换）
+        const OP_CONST_INT8: u8 = 130;
+        const OP_GET_LOCAL: u8 = 50;
+        const OP_GET_LOCAL_INT: u8 = 134;
+        const OP_ADD_INT: u8 = 120;
+        const OP_SUB_INT: u8 = 121;
+        const OP_LE_INT: u8 = 125;
+        const OP_LT_INT: u8 = 124;
+        const OP_GET_LOCAL_ADD_INT: u8 = 131;
+        const OP_GET_LOCAL_SUB_INT: u8 = 132;
+        const OP_GET_LOCAL_LE_INT: u8 = 137;
+        const OP_JUMP_IF_FALSE: u8 = 61;
+        const OP_JUMP_IF_FALSE_POP: u8 = 133;
+        const OP_CALL: u8 = 81;
+        const OP_RETURN: u8 = 82;
+        const OP_CONST: u8 = 0;
+        const OP_HALT: u8 = 255;
+        
+        loop {
+            let op = self.read_byte();
+            
+            // 热路径：直接 u8 匹配，避免 OpCode::from() 开销
+            match op {
+                OP_CONST_INT8 => {
+                    let value = self.read_byte() as i8 as i64;
+                    self.push_fast(Value::int(value));
+                    continue;
+                }
+                OP_GET_LOCAL => {
+                    let slot = self.read_u16() as usize;
+                    let actual_slot = self.current_base + slot;
+                    let value = unsafe { self.stack.get_unchecked(actual_slot).clone() };
+                    self.push_fast(value);
+                    continue;
+                }
+                OP_GET_LOCAL_INT => {
+                    let slot = self.read_u16() as usize;
+                    let actual_slot = self.current_base + slot;
+                    let value = unsafe { self.stack.get_unchecked(actual_slot).clone() };
+                    self.push_fast(value);
+                    continue;
+                }
+                OP_ADD_INT => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(x + y));
+                    continue;
+                }
+                OP_SUB_INT => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(x - y));
+                    continue;
+                }
+                OP_LE_INT => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x <= y));
+                    continue;
+                }
+                OP_LT_INT => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x < y));
+                    continue;
+                }
+                OP_GET_LOCAL_ADD_INT => {
+                    let slot = self.read_u16() as usize;
+                    let add_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(n + add_value));
+                    continue;
+                }
+                OP_GET_LOCAL_SUB_INT => {
+                    let slot = self.read_u16() as usize;
+                    let sub_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(n - sub_value));
+                    continue;
+                }
+                OP_GET_LOCAL_LE_INT => {
+                    let slot = self.read_u16() as usize;
+                    let cmp_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let local = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { local.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(n <= cmp_value));
+                    continue;
+                }
+                OP_JUMP_IF_FALSE => {
+                    let offset = self.read_u16() as i16;
+                    let condition = self.peek()?;
+                    if !condition.is_truthy() {
+                        self.ip = (self.ip as isize + offset as isize) as usize;
+                    }
+                    continue;
+                }
+                OP_JUMP_IF_FALSE_POP => {
+                    let offset = self.read_u16() as usize;
+                    let condition = self.pop_fast();
+                    if !condition.is_truthy() {
+                        self.ip += offset;
+                    }
+                    continue;
+                }
+                OP_CONST => {
+                    let index = self.read_u16() as usize;
+                    let value = unsafe { self.chunk.constants.get_unchecked(index).clone() };
+                    self.push_fast(value);
+                    continue;
+                }
+                OP_CALL => {
+                    let arg_count = self.read_byte() as usize;
+                    let callee_idx = self.stack.len() - arg_count - 1;
+                    let callee = unsafe { self.stack.get_unchecked(callee_idx).clone() };
+                    
+                    if let Some(func) = callee.as_function() {
+                        // 快速路径：简单函数调用
+                        if !func.has_variadic && func.defaults.is_empty() && arg_count == func.arity {
+                            if self.frames.len() >= MAX_FRAMES {
+                                return Err(self.runtime_error("Stack overflow"));
+                            }
+                            let base_slot = callee_idx + 1;
+                            self.frames.push(CallFrame {
+                                return_ip: self.ip as u32,
+                                base_slot: base_slot as u16,
+                                is_method_call: false,
+                            });
+                            self.current_base = base_slot;
+                            self.ip = func.chunk_index;
+                            continue;
+                        }
+                    }
+                    // 回退到完整处理
+                    self.ip -= 2; // 回退 arg_count 字节
+                }
+                OP_RETURN => {
+                    let return_value = self.pop_fast();
+                    
+                    if self.frames.is_empty() {
+                        self.push_fast(return_value);
+                        return Ok(());
+                    }
+                    
+                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                    let truncate_to = if frame.is_method_call {
+                        frame.base_slot as usize
+                    } else {
+                        (frame.base_slot as usize).saturating_sub(1)
+                    };
+                    self.stack.truncate(truncate_to);
+                    self.push_fast(return_value);
+                    self.ip = frame.return_ip as usize;
+                    self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                    continue;
+                }
+                OP_HALT => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+            
+            // 冷路径：使用 OpCode::from() 处理其他指令
+            let opcode = OpCode::from(op);
+            
+            match opcode {
+                OpCode::Const => {
+                    let index = self.read_u16() as usize;
+                    // SAFETY: 编译器保证索引在常量池范围内
+                    let value = unsafe { self.chunk.constants.get_unchecked(index).clone() };
+                    self.push_fast(value);
+                }
+                
+                OpCode::Pop => {
+                    self.pop()?;
+                }
+                
+                OpCode::Add => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::int(x + y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::float(x + y));
+                    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+                        self.push_fast(Value::float(x as f64 + y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+                        self.push_fast(Value::float(x + y as f64));
+                    } else if let (Some(s1), Some(s2)) = (a.as_string(), b.as_string()) {
+                        self.push_fast(Value::string(format!("{}{}", s1, s2)));
+                    } else if a.is_class() || a.is_struct() {
+                        // 只对 Class/Struct 类型检查运算符重载
+                        if let Some(result) = self.try_operator_overload(&a, &b, "add")? {
+                            self.push_fast(result);
+                        } else {
+                    let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                            self.push_fast(result);
+                        }
+                    } else {
+                        let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Sub => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::int(x - y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::float(x - y));
+                    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+                        self.push_fast(Value::float(x as f64 - y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+                        self.push_fast(Value::float(x - y as f64));
+                    } else if a.is_class() || a.is_struct() {
+                        if let Some(result) = self.try_operator_overload(&a, &b, "sub")? {
+                            self.push_fast(result);
+                        } else {
+                    let result = (a - b).map_err(|e| self.runtime_error(&e))?;
+                            self.push_fast(result);
+                        }
+                    } else {
+                        let result = (a - b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Mul => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push(Value::int(x * y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push(Value::float(x * y));
+                    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+                        self.push(Value::float(x as f64 * y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+                        self.push(Value::float(x * y as f64));
+                    } else if a.is_class() || a.is_struct() {
+                        if let Some(result) = self.try_operator_overload(&a, &b, "mul")? {
+                            self.push(result);
+                        } else {
+                    let result = (a * b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                        }
+                    } else {
+                        let result = (a * b).map_err(|e| self.runtime_error(&e))?;
+                        self.push(result);
+                    }
+                }
+                
+                OpCode::Div => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        if y == 0 {
+                            return Err(self.runtime_error("Division by zero"));
+                        }
+                        self.push(Value::int(x / y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push(Value::float(x / y));
+                    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+                        self.push(Value::float(x as f64 / y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+                        self.push(Value::float(x / y as f64));
+                    } else if a.is_class() || a.is_struct() {
+                        if let Some(result) = self.try_operator_overload(&a, &b, "div")? {
+                            self.push(result);
+                        } else {
+                    let result = (a / b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                        }
+                    } else {
+                        let result = (a / b).map_err(|e| self.runtime_error(&e))?;
+                        self.push(result);
+                    }
+                }
+                
+                OpCode::Mod => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        if y == 0 {
+                            return Err(self.runtime_error("Modulo by zero"));
+                        }
+                        self.push(Value::int(x % y));
+                    } else {
+                    let result = (a % b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                    }
+                }
+                
+                OpCode::Pow => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        if y >= 0 {
+                            self.push(Value::int(x.pow(y as u32)));
+                        } else {
+                            self.push(Value::float((x as f64).powf(y as f64)));
+                        }
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push(Value::float(x.powf(y)));
+                    } else if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+                        self.push(Value::float((x as f64).powf(y)));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+                        self.push(Value::float(x.powf(y as f64)));
+                    } else {
+                    let result = a.pow(b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                    }
+                }
+                
+                OpCode::Neg => {
+                    let a = self.pop()?;
+                    // 整数快速路径
+                    if let Some(x) = a.as_int() {
+                        self.push(Value::int(-x));
+                    } else if let Some(x) = a.as_float() {
+                        self.push(Value::float(-x));
+                    } else {
+                    let result = (-a).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                    }
+                }
+                
+                OpCode::Eq => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x == y));
+                    } else if let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) {
+                        self.push_fast(Value::bool(x == y));
+                    } else {
+                        self.push_fast(a.eq_value(&b));
+                    }
+                }
+                
+                OpCode::Ne => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x != y));
+                    } else if let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) {
+                        self.push_fast(Value::bool(x != y));
+                    } else {
+                        self.push_fast(a.ne_value(&b));
+                    }
+                }
+                
+                OpCode::Lt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x < y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::bool(x < y));
+                    } else {
+                    let result = a.lt(&b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Le => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x <= y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::bool(x <= y));
+                    } else {
+                    let result = a.le(&b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Gt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x > y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::bool(x > y));
+                    } else {
+                    let result = a.gt(&b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Ge => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // 整数快速路径
+                    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                        self.push_fast(Value::bool(x >= y));
+                    } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                        self.push_fast(Value::bool(x >= y));
+                    } else {
+                    let result = a.ge(&b).map_err(|e| self.runtime_error(&e))?;
+                        self.push_fast(result);
+                    }
+                }
+                
+                OpCode::Not => {
+                    let a = self.pop()?;
+                    self.push(a.not());
+                }
+                
+                OpCode::BitAnd => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let result = a.bit_and(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::BitOr => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let result = a.bit_or(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::BitXor => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let result = a.bit_xor(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::BitNot => {
+                    let a = self.pop()?;
+                    let result = a.bit_not().map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::Shl => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let result = a.shl(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::Shr => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let result = a.shr(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push(result);
+                }
+                
+                OpCode::Print => {
+                    let value = self.pop()?;
+                    print!("{}", value);
+                }
+                
+                OpCode::PrintLn => {
+                    let value = self.pop()?;
+                    println!("{}", value);
+                }
+                
+                OpCode::TypeOf => {
+                    let value = self.pop()?;
+                    let type_name = value.type_name();
+                    self.push(Value::string(type_name.to_string()));
+                }
+                
+                OpCode::SizeOf => {
+                    let value = self.pop()?;
+                    let size = if value.is_null() {
+                        0
+                    } else if value.is_bool() {
+                        1
+                    } else if value.is_int() {
+                        8
+                    } else if value.is_float() {
+                        8
+                    } else if value.is_char() {
+                        4
+                    } else if let Some(s) = value.as_string() {
+                        s.len() as i64
+                    } else if value.is_function() {
+                        0 // 函数大小不适用
+                    } else if let Some(arr) = value.as_array() {
+                        arr.borrow().len() as i64
+                    } else if let Some(m) = value.as_map() {
+                        m.borrow().len() as i64
+                    } else if value.is_range() {
+                        24 // 两个i64 + bool
+                    } else if value.is_iterator() {
+                        0 // 迭代器大小不适用
+                    } else if let Some(s) = value.as_struct() {
+                        s.borrow().fields.len() as i64 // 字段数量
+                    } else if let Some(c) = value.as_class() {
+                        c.borrow().fields.len() as i64 // 字段数量
+                    } else if let Some(e) = value.as_enum() {
+                        e.associated_data.len() as i64 // 关联数据字段数量
+                    } else {
+                        0 // 类型引用本身没有大小
+                    };
+                    self.push(Value::int(size));
+                }
+                
+                OpCode::Time => {
+                    // 获取当前时间戳（毫秒）
+                    // [deprecated] 可能在未来版本移除
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    self.push(Value::int(timestamp));
+                }
+                
+                OpCode::Panic => {
+                    let value = self.pop()?;
+                    return Err(self.runtime_error(&format!("Panic: {}", value)));
+                }
+                
+                OpCode::ToString => {
+                    let value = self.pop()?;
+                    let string_value = if let Some(s) = value.as_string() {
+                        s.clone()
+                    } else if let Some(n) = value.as_int() {
+                        n.to_string()
+                    } else if let Some(f) = value.as_float() {
+                        f.to_string()
+                    } else if let Some(b) = value.as_bool() {
+                        b.to_string()
+                    } else if let Some(c) = value.as_char() {
+                        c.to_string()
+                    } else if value.is_null() {
+                        "null".to_string()
+                    } else if let Some(arr) = value.as_array() {
+                        format!("{:?}", arr.borrow())
+                    } else if let Some(m) = value.as_map() {
+                        format!("{:?}", m.borrow())
+                    } else if let Some(s) = value.as_struct() {
+                        format!("struct {}{{...}}", s.borrow().type_name)
+                    } else if let Some(c) = value.as_class() {
+                        format!("class {}{{...}}", c.borrow().class_name)
+                    } else if let Some(e) = value.as_enum() {
+                        format!("{}::{}", e.enum_name, e.variant_name)
+                    } else {
+                        format!("{}", value)
+                    };
+                    self.push(Value::string(string_value));
+                }
+                
+                OpCode::CastSafe => {
+                    let type_name_index = self.read_u16() as usize;
+                    let type_name = if let Some(s) = self.chunk.constants[type_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid type name"));
+                    };
+                    
+                    let value = self.pop()?;
+                    let result = self.try_cast_value(value, &type_name);
+                    self.push(result);
+                }
+                
+                OpCode::CastForce => {
+                    let type_name_index = self.read_u16() as usize;
+                    let type_name = if let Some(s) = self.chunk.constants[type_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid type name"));
+                    };
+                    
+                    let value = self.pop()?;
+                    let result = self.try_cast_value(value.clone(), &type_name);
+                    if result.is_null() {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot cast {} to {}",
+                            value.type_name(),
+                            type_name
+                        )));
+                    } else {
+                        self.push(result);
+                    }
+                }
+                
+                OpCode::TypeCheck => {
+                    let type_name_index = self.read_u16() as usize;
+                    let type_name = if let Some(s) = self.chunk.constants[type_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid type name"));
+                    };
+                    
+                    let value = self.pop()?;
+                    let is_type = self.check_value_type(&value, &type_name);
+                    self.push(Value::bool(is_type));
+                }
+                
+                OpCode::NewArray => {
+                    let count = self.read_u16() as usize;
+                    let mut elements = Vec::with_capacity(count);
+                    // 从栈上弹出元素（逆序，因为先压入的在栈底）
+                    for _ in 0..count {
+                        elements.push(self.pop()?);
+                    }
+                    elements.reverse();
+                    self.push(Value::array(std::rc::Rc::new(std::cell::RefCell::new(elements))));
+                }
+                
+                OpCode::NewMap => {
+                    let count = self.read_u16() as usize;
+                    let mut map = std::collections::HashMap::with_capacity(count);
+                    // 从栈上弹出键值对（逆序）
+                    let mut pairs = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let value = self.pop()?;
+                        let key = self.pop()?;
+                        pairs.push((key, value));
+                    }
+                    // 按正确顺序插入
+                    for (key, value) in pairs.into_iter().rev() {
+                        let key_str = if let Some(s) = key.as_string() {
+                            s.clone()
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Map key must be string, got {}",
+                                key.type_name()
+                            )));
+                        };
+                        map.insert(key_str, value);
+                    }
+                    self.push(Value::map(std::rc::Rc::new(std::cell::RefCell::new(map))));
+                }
+                
+                OpCode::GetIndex => {
+                    let index = self.pop()?;
+                    let object = self.pop()?;
+                    
+                    if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
+                            let arr = arr.borrow();
+                        let idx = if i < 0 {
+                            (arr.len() as i64 + i) as usize
+                            } else {
+                            i as usize
+                            };
+                            if idx >= arr.len() {
+                                return Err(self.runtime_error(&format!(
+                                    "Index {} out of bounds for array of length {}", i, arr.len()
+                                )));
+                            }
+                            self.push(arr[idx].clone());
+                    } else if let (Some(s), Some(i)) = (object.as_string(), index.as_int()) {
+                        let idx = if i < 0 {
+                            (s.len() as i64 + i) as usize
+                            } else {
+                            i as usize
+                            };
+                            if let Some(c) = s.chars().nth(idx) {
+                            self.push(Value::char(c));
+                            } else {
+                                return Err(self.runtime_error(&format!(
+                                    "Index {} out of bounds for string of length {}", i, s.len()
+                                )));
+                            }
+                    } else if let (Some(m), Some(key)) = (object.as_map(), index.as_string()) {
+                        let m = m.borrow();
+                        if let Some(v) = m.get(key) {
+                            self.push(v.clone());
+                        } else {
+                            self.push(Value::null());
+                        }
+                    } else {
+                            return Err(self.runtime_error(&format!(
+                                "Cannot index {} with {}", object.type_name(), index.type_name()
+                            )));
+                    }
+                }
+                
+                OpCode::SetIndex => {
+                    let value = self.pop()?;
+                    let index = self.pop()?;
+                    let object = self.pop()?;
+                    
+                    if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
+                            let mut arr = arr.borrow_mut();
+                        let idx = if i < 0 {
+                            (arr.len() as i64 + i) as usize
+                            } else {
+                            i as usize
+                            };
+                            if idx >= arr.len() {
+                                return Err(self.runtime_error(&format!(
+                                    "Index {} out of bounds for array of length {}", i, arr.len()
+                                )));
+                            }
+                        arr[idx] = value;
+                            self.push(value);
+                    } else if let (Some(m), Some(key)) = (object.as_map(), index.as_string()) {
+                        let mut m = m.borrow_mut();
+                        m.insert(key.clone(), value);
+                        self.push(value);
+                    } else {
+                            return Err(self.runtime_error(&format!(
+                                "Cannot set index on {}", object.type_name()
+                            )));
+                    }
+                }
+                
+                OpCode::NewRange => {
+                    let end = self.pop()?;
+                    let start = self.pop()?;
+                    
+                    if let (Some(s), Some(e)) = (start.as_int(), end.as_int()) {
+                        self.push(Value::range(s, e, false));
+                    } else {
+                            return Err(self.runtime_error(&format!(
+                                "Range requires integer bounds, got {} and {}",
+                                start.type_name(), end.type_name()
+                            )));
+                    }
+                }
+                
+                OpCode::NewRangeInclusive => {
+                    let end = self.pop()?;
+                    let start = self.pop()?;
+                    
+                    if let (Some(s), Some(e)) = (start.as_int(), end.as_int()) {
+                        self.push(Value::range(s, e, true));
+                    } else {
+                            return Err(self.runtime_error(&format!(
+                                "Range requires integer bounds, got {} and {}",
+                                start.type_name(), end.type_name()
+                            )));
+                    }
+                }
+                
+                OpCode::IterInit => {
+                    let iterable = self.pop()?;
+                    
+                    let iter = if let Some(arr) = iterable.as_array() {
+                            Iterator {
+                            source: IteratorSource::Array(arr.clone()),
+                                index: 0,
+                            }
+                    } else if let Some((start, end, inclusive)) = iterable.as_range() {
+                            Iterator {
+                                source: IteratorSource::Range(start, end, inclusive),
+                                index: 0,
+                            }
+                    } else {
+                            return Err(self.runtime_error(&format!(
+                                "Cannot iterate over {}",
+                                iterable.type_name()
+                            )));
+                    };
+                    self.push(Value::iterator(std::rc::Rc::new(std::cell::RefCell::new(iter))));
+                }
+                
+                OpCode::IterNext => {
+                    // 获取迭代器但不弹出
+                    let iter_val = self.peek()?.clone();
+                    
+                    if let Some(iter_rc) = iter_val.as_iterator() {
+                        // 先获取当前索引和源的克隆
+                        let (index, source_clone) = {
+                            let iter = iter_rc.borrow();
+                            (iter.index, iter.source.clone())
+                        };
+                        
+                        let (value, has_more) = match source_clone {
+                            IteratorSource::Array(arr) => {
+                                let arr = arr.borrow();
+                                if index < arr.len() {
+                                    let value = arr[index].clone();
+                                    (value, true)
+                                } else {
+                                    (Value::null(), false)
+                                }
+                            }
+                            IteratorSource::Range(start, end, inclusive) => {
+                                let current = start + index as i64;
+                                let has_more = if inclusive {
+                                    current <= end
+                                } else {
+                                    current < end
+                                };
+                                
+                                if has_more {
+                                    (Value::int(current), true)
+                                } else {
+                                    (Value::null(), false)
+                                }
+                            }
+                        };
+                        
+                        // 如果有下一个元素，更新索引
+                        if has_more {
+                            iter_rc.borrow_mut().index += 1;
+                        }
+                        
+                        self.push(value);
+                        self.push(Value::bool(has_more));
+                    } else {
+                        return Err(self.runtime_error("IterNext requires an iterator"));
+                    }
+                }
+                
+                OpCode::GetLocal => {
+                    let slot = self.read_u16() as usize;
+                    // 使用缓存的栈基址，无边界检查
+                    let actual_slot = self.current_base + slot;
+                    // SAFETY: 编译器保证 slot 在有效范围内
+                    let value = unsafe { self.stack.get_unchecked(actual_slot).clone() };
+                    self.push_fast(value);
+                }
+                
+                OpCode::SetLocal => {
+                    let slot = self.read_u16() as usize;
+                    let value = self.peek()?.clone();
+                    // 使用缓存的栈基址
+                    let actual_slot = self.current_base + slot;
+                    self.stack[actual_slot] = value;
+                }
+                
+                OpCode::Jump => {
+                    let offset = self.read_u16() as usize;
+                    self.ip += offset;
+                }
+                
+                OpCode::JumpIfFalse => {
+                    let offset = self.read_u16() as usize;
+                    // SAFETY: peek 在非空栈上调用
+                    let top = unsafe { self.stack.last().unwrap_unchecked() };
+                    if !top.is_truthy() {
+                        self.ip += offset;
+                    }
+                }
+                
+                OpCode::JumpIfTrue => {
+                    let offset = self.read_u16() as usize;
+                    // SAFETY: peek 在非空栈上调用
+                    let top = unsafe { self.stack.last().unwrap_unchecked() };
+                    if top.is_truthy() {
+                        self.ip += offset;
+                    }
+                }
+                
+                OpCode::Loop => {
+                    let offset = self.read_u16() as usize;
+                    self.ip -= offset;
+                }
+                
+                OpCode::Closure => {
+                    // Closure 指令已被替换为直接加载函数常量
+                    // 这个分支不应该被执行
+                    let _func_index = self.read_u16();
+                    let msg = "Unexpected Closure opcode";
+                    return Err(self.runtime_error(msg));
+                }
+                
+                OpCode::Call => {
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 获取被调用的函数（在参数下方）
+                    let callee_idx = self.stack.len() - arg_count - 1;
+                    let callee = self.stack[callee_idx].clone();
+                    
+                    if let Some(func) = callee.as_function() {
+                        // 快速路径：简单函数调用（参数数量匹配，无默认值，无可变参数）
+                        if !func.has_variadic && func.defaults.is_empty() && arg_count == func.arity {
+                            // 检查调用深度
+                            if self.frames.len() >= MAX_FRAMES {
+                                let msg = "Stack overflow: too many nested function calls";
+                                return Err(self.runtime_error(msg));
+                            }
+                            
+                            // 创建调用帧
+                            let base_slot = callee_idx + 1;
+                            self.frames.push(CallFrame {
+                                return_ip: self.ip as u32,
+                                base_slot: base_slot as u16,
+                                is_method_call: false,
+                            });
+                            
+                            // 更新缓存的栈基址
+                            self.current_base = base_slot;
+                            
+                            // 跳转到函数体
+                            self.ip = func.chunk_index;
+                        } else {
+                            // 慢速路径：处理默认参数和可变参数
+                        let fixed_params = if func.has_variadic { func.arity - 1 } else { func.arity };
+                        
+                        // 检查必需参数数量
+                        if arg_count < func.required_params {
+                            let msg = format!(
+                                "Expected at least {} arguments but got {}",
+                                func.required_params, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                        // 如果没有可变参数，检查参数上限
+                        if !func.has_variadic && arg_count > func.arity {
+                            let msg = format!(
+                                "Expected at most {} arguments but got {}",
+                                func.arity, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                            // 处理可变参数
+                        if func.has_variadic {
+                            let variadic_count = if arg_count > fixed_params {
+                                arg_count - fixed_params
+                            } else {
+                                0
+                            };
+                            
+                            let mut variadic_args = Vec::with_capacity(variadic_count);
+                            for _ in 0..variadic_count {
+                                variadic_args.push(self.pop()?);
+                            }
+                                variadic_args.reverse();
+                            
+                                self.push(Value::array(Rc::new(std::cell::RefCell::new(variadic_args))));
+                        }
+                        
+                            // 填充缺失的默认参数
+                        let current_fixed_args = if func.has_variadic {
+                            std::cmp::min(arg_count, fixed_params)
+                        } else {
+                            arg_count
+                        };
+                        let missing_count = fixed_params - current_fixed_args;
+                        if missing_count > 0 {
+                            let defaults_start = func.defaults.len() - missing_count;
+                            if func.has_variadic {
+                                let variadic_array = self.pop()?;
+                                for i in 0..missing_count {
+                                    self.push(func.defaults[defaults_start + i].clone());
+                                }
+                                self.push(variadic_array);
+                            } else {
+                                for i in 0..missing_count {
+                                    self.push(func.defaults[defaults_start + i].clone());
+                                }
+                            }
+                        }
+                        
+                        // 检查调用深度
+                        if self.frames.len() >= MAX_FRAMES {
+                            let msg = "Stack overflow: too many nested function calls";
+                            return Err(self.runtime_error(msg));
+                        }
+                        
+                        // 创建调用帧
+                            let base_slot = callee_idx + 1;
+                            self.frames.push(CallFrame {
+                                return_ip: self.ip as u32,
+                                base_slot: base_slot as u16,
+                                is_method_call: false,
+                            });
+                            
+                            // 更新缓存的栈基址
+                            self.current_base = base_slot;
+                        
+                        // 跳转到函数体
+                        self.ip = func.chunk_index;
+                        }
+                    } else {
+                        let msg = format!("Cannot call {}", callee.type_name());
+                        return Err(self.runtime_error(&msg));
+                    }
+                }
+                
+                OpCode::Return => {
+                    // 获取返回值
+                    let return_value = self.pop_fast();
+                    
+                    // 如果没有调用帧，说明是顶层返回
+                    if self.frames.is_empty() {
+                        // 压回返回值（供外部使用）
+                        self.push_fast(return_value);
+                        return Ok(());
+                    }
+                    
+                    // 弹出调用帧
+                    let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                    
+                    // 清理栈：移除函数值/receiver 和所有局部变量
+                    // 对于方法调用：base_slot 指向 receiver，截断到 base_slot
+                    // 对于函数调用：base_slot 指向第一个参数，截断到 base_slot - 1（移除函数值）
+                    let truncate_to = if frame.is_method_call {
+                        frame.base_slot as usize
+                    } else {
+                        (frame.base_slot as usize).saturating_sub(1)
+                    };
+                    self.stack.truncate(truncate_to);
+                    
+                    // 压入返回值
+                    self.push_fast(return_value);
+                    
+                    // 恢复指令指针
+                    self.ip = frame.return_ip as usize;
+                    
+                    // 更新缓存的栈基址
+                    self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                }
+                
+                OpCode::NewStruct => {
+                    let field_count = self.read_byte() as usize;
+                    let type_name_index = self.read_u16() as usize;
+                    
+                    // 从常量池获取类型名称
+                    let type_name = if let Some(s) = self.chunk.constants[type_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid struct type name"));
+                    };
+                    
+                    // 从栈中弹出字段（逆序，因为先压入的在栈底）
+                    let mut fields = std::collections::HashMap::new();
+                    for _ in 0..field_count {
+                        let value = self.pop()?;
+                        let field_name_val = self.pop()?;
+                        let field_name = if let Some(s) = field_name_val.as_string() {
+                            s.clone()
+                        } else {
+                            return Err(self.runtime_error("Invalid field name"));
+                        };
+                        fields.insert(field_name, value);
+                    }
+                    
+                    // 创建 struct 实例
+                    let instance = StructInstance { type_name, fields };
+                    self.push(Value::struct_val(Rc::new(std::cell::RefCell::new(instance))));
+                }
+                
+                OpCode::GetField => {
+                    let field_name_index = self.read_u16() as usize;
+                    let field_name = if let Some(s) = self.chunk.constants[field_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid field name"));
+                    };
+                    
+                    let obj_val = self.pop()?;
+                    if let Some(s) = obj_val.as_struct() {
+                        let s = s.borrow();
+                        if let Some(value) = s.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Struct '{}' has no field '{}'",
+                                s.type_name, field_name
+                            )));
+                        }
+                    } else if let Some(c) = obj_val.as_class() {
+                        let c = c.borrow();
+                        if let Some(value) = c.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Class '{}' has no field '{}'",
+                                c.class_name, field_name
+                            )));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot access field '{}' on {}",
+                            field_name,
+                            obj_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::SetField => {
+                    let field_name_index = self.read_u16() as usize;
+                    let field_name = if let Some(s) = self.chunk.constants[field_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid field name"));
+                    };
+                    
+                    let value = self.pop()?;
+                    let obj_val = self.peek()?.clone(); // 保留对象在栈上
+                    if let Some(s) = obj_val.as_struct() {
+                            let mut s = s.borrow_mut();
+                            if s.fields.contains_key(&field_name) {
+                                s.fields.insert(field_name, value);
+                            } else {
+                                return Err(self.runtime_error(&format!(
+                                    "Struct '{}' has no field '{}'",
+                                    s.type_name, field_name
+                                )));
+                            }
+                    } else if let Some(c) = obj_val.as_class() {
+                        let mut c = c.borrow_mut();
+                        // 对于 class，允许设置已定义的字段或新字段
+                        c.fields.insert(field_name, value);
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot set field '{}' on {}",
+                            field_name,
+                            obj_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::JumpIfNull => {
+                    let offset = self.read_u16() as usize;
+                    let value = self.peek()?;
+                    if value.is_null() {
+                        // 只跳转，不弹出（由后续指令处理）
+                        self.ip += offset;
+                    }
+                }
+                
+                OpCode::SafeGetField => {
+                    let field_name_index = self.read_u16() as usize;
+                    let field_name = if let Some(s) = self.chunk.constants[field_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid field name"));
+                    };
+                    
+                    let obj_val = self.pop()?;
+                    // 如果对象为 null，直接返回 null
+                    if obj_val.is_null() {
+                        self.push(Value::null());
+                    } else if let Some(s) = obj_val.as_struct() {
+                        let s = s.borrow();
+                        if let Some(value) = s.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            self.push(Value::null());
+                        }
+                    } else if let Some(c) = obj_val.as_class() {
+                        let c = c.borrow();
+                        if let Some(value) = c.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            self.push(Value::null());
+                        }
+                    } else {
+                        self.push(Value::null());
+                    }
+                }
+                
+                OpCode::NonNullGetField => {
+                    let field_name_index = self.read_u16() as usize;
+                    let field_name = if let Some(s) = self.chunk.constants[field_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid field name"));
+                    };
+                    
+                    let obj_val = self.pop()?;
+                    // 如果对象为 null，触发 panic
+                    if obj_val.is_null() {
+                        return Err(self.runtime_error("Non-null assertion failed: value is null"));
+                    }
+                    if let Some(s) = obj_val.as_struct() {
+                        let s = s.borrow();
+                        if let Some(value) = s.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Struct '{}' has no field '{}'",
+                                s.type_name, field_name
+                            )));
+                        }
+                    } else if let Some(c) = obj_val.as_class() {
+                        let c = c.borrow();
+                        if let Some(value) = c.fields.get(&field_name) {
+                            self.push(value.clone());
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Class '{}' has no field '{}'",
+                                c.class_name, field_name
+                            )));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot access field '{}' on {}",
+                            field_name,
+                            obj_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::InvokeMethod => {
+                    let method_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 获取方法名
+                    let method_name = if let Some(s) = self.chunk.constants[method_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid method name"));
+                    };
+                    
+                    // 获取 receiver（在参数下方）
+                    let receiver_idx = self.stack.len() - arg_count - 1;
+                    let receiver = self.stack[receiver_idx].clone();
+                    
+                    // 检查是否是类型引用（静态方法调用）
+                    if let Some(class_name) = receiver.as_type_ref() {
+                        let class_name = class_name.clone();
+                        // 查找静态方法
+                        let func_index = match self.chunk.get_static_method(&class_name, &method_name) {
+                            Some(idx) => idx as usize,
+                            None => return Err(self.runtime_error(&format!(
+                                "Class '{}' has no static method '{}'",
+                                class_name, method_name
+                            ))),
+                        };
+                        
+                        let func = if let Some(f) = self.chunk.constants[func_index].as_function() {
+                            f.clone()
+                        } else {
+                            return Err(self.runtime_error("Static method is not a function"));
+                        };
+                        
+                        // 移除类型引用，静态方法不需要 this
+                        self.stack.remove(receiver_idx);
+                        let base = self.stack.len() - arg_count;
+                        
+                        // 填充默认参数
+                        let missing = func.arity.saturating_sub(arg_count);
+                        if missing > 0 && !func.defaults.is_empty() {
+                            let start = func.defaults.len().saturating_sub(missing);
+                            for i in 0..missing {
+                                if start + i < func.defaults.len() {
+                                    self.push(func.defaults[start + i].clone());
+                                }
+                            }
+                        }
+                        
+                        if self.frames.len() >= MAX_FRAMES {
+                            return Err(self.runtime_error("Stack overflow"));
+                        }
+                        
+                        let frame = CallFrame {
+                            return_ip: self.ip as u32,
+                            base_slot: base as u16,
+                            is_method_call: false, // 静态方法没有 this，类似普通函数调用
+                        };
+                        self.frames.push(frame);
+                        self.ip = func.chunk_index;
+                        continue;
+                    }
+                    
+                    // 检查是否是数组方法调用
+                    if let Some(arr) = receiver.as_array() {
+                        match method_name.as_str() {
+                            "push" => {
+                                // arr.push(value) - 向数组末尾添加元素
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("push() expects 1 argument"));
+                                }
+                                let value = self.stack[receiver_idx + 1].clone();
+                                arr.borrow_mut().push(value);
+                                // 移除参数和 receiver，返回 null
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "pop" => {
+                                // arr.pop() - 移除并返回数组末尾元素
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("pop() expects 0 arguments"));
+                                }
+                                let popped = arr.borrow_mut().pop().unwrap_or(Value::null());
+                                // 移除 receiver，返回弹出的值
+                                self.stack.truncate(receiver_idx);
+                                self.push(popped);
+                                continue;
+                            }
+                            "len" => {
+                                // arr.len() - 返回数组长度
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("len() expects 0 arguments"));
+                                }
+                                let len = arr.borrow().len() as i64;
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(len));
+                                continue;
+                            }
+                            "first" => {
+                                // arr.first() - 返回第一个元素
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("first() expects 0 arguments"));
+                                }
+                                let first = arr.borrow().first().cloned().unwrap_or(Value::null());
+                                self.stack.truncate(receiver_idx);
+                                self.push(first);
+                                continue;
+                            }
+                            "last" => {
+                                // arr.last() - 返回最后一个元素
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("last() expects 0 arguments"));
+                                }
+                                let last = arr.borrow().last().cloned().unwrap_or(Value::null());
+                                self.stack.truncate(receiver_idx);
+                                self.push(last);
+                                continue;
+                            }
+                            "contains" => {
+                                // arr.contains(value) - 检查数组是否包含某值
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("contains() expects 1 argument"));
+                                }
+                                let value = self.stack[receiver_idx + 1].clone();
+                                let contains = arr.borrow().contains(&value);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(contains));
+                                continue;
+                            }
+                            "reverse" => {
+                                // arr.reverse() - 反转数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("reverse() expects 0 arguments"));
+                                }
+                                arr.borrow_mut().reverse();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "clear" => {
+                                // arr.clear() - 清空数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("clear() expects 0 arguments"));
+                                }
+                                arr.borrow_mut().clear();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "indexOf" => {
+                                // arr.indexOf(value) - 查找元素索引
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("indexOf() expects 1 argument"));
+                                }
+                                let value = self.stack[receiver_idx + 1].clone();
+                                let idx = arr.borrow().iter().position(|x| x == &value)
+                                    .map(|i| i as i64)
+                                    .unwrap_or(-1);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(idx));
+                                continue;
+                            }
+                            "lastIndexOf" => {
+                                // arr.lastIndexOf(value) - 查找最后一个元素索引
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("lastIndexOf() expects 1 argument"));
+                                }
+                                let value = self.stack[receiver_idx + 1].clone();
+                                let idx = arr.borrow().iter().rposition(|x| x == &value)
+                                    .map(|i| i as i64)
+                                    .unwrap_or(-1);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(idx));
+                                continue;
+                            }
+                            "join" => {
+                                // arr.join(separator) - 连接为字符串
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("join() expects 1 argument"));
+                                }
+                                let sep = if let Some(s) = self.stack[receiver_idx + 1].as_string() {
+                                    s.clone()
+                                } else {
+                                    return Err(self.runtime_error("join() expects a string argument"));
+                                };
+                                let result: String = arr.borrow().iter()
+                                    .map(|v| format!("{}", v))
+                                    .collect::<Vec<_>>()
+                                    .join(&sep);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "slice" => {
+                                // arr.slice(start, end?) - 截取数组
+                                if arg_count < 1 || arg_count > 2 {
+                                    return Err(self.runtime_error("slice() expects 1 or 2 arguments"));
+                                }
+                                let start = if let Some(i) = self.stack[receiver_idx + 1].as_int() {
+                                    i as usize
+                                } else {
+                                    return Err(self.runtime_error("slice() first argument must be integer"));
+                                };
+                                let arr_len = arr.borrow().len();
+                                let end = if arg_count == 2 {
+                                    if let Some(i) = self.stack[receiver_idx + 2].as_int() {
+                                        (i as usize).min(arr_len)
+                                    } else {
+                                        return Err(self.runtime_error("slice() second argument must be integer"));
+                                    }
+                                } else {
+                                    arr_len
+                                };
+                                let result: Vec<Value> = arr.borrow()[start.min(arr_len)..end].to_vec();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                continue;
+                            }
+                            "concat" => {
+                                // arr.concat(other) - 连接两个数组
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("concat() expects 1 argument"));
+                                }
+                                let other = if let Some(a) = self.stack[receiver_idx + 1].as_array() {
+                                    a.borrow().clone()
+                                } else {
+                                    return Err(self.runtime_error("concat() expects an array argument"));
+                                };
+                                let mut result = arr.borrow().clone();
+                                result.extend(other);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                continue;
+                            }
+                            "copy" => {
+                                // arr.copy() - 复制数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("copy() expects 0 arguments"));
+                                }
+                                let result = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                continue;
+                            }
+                            "isEmpty" => {
+                                // arr.isEmpty() - 检查是否为空
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("isEmpty() expects 0 arguments"));
+                                }
+                                let result = arr.borrow().is_empty();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "collect" => {
+                                // arr.collect(fn) - 映射转换 (注: map 是关键字，用 collect 代替)
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("map() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("map() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut results = Vec::with_capacity(elements.len());
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let result = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    results.push(result);
+                                }
+                                self.push(Value::array(Rc::new(RefCell::new(results))));
+                                continue;
+                            }
+                            "filter" | "where" => {
+                                // arr.filter(fn) / arr.where(fn) - 过滤筛选
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("filter() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("filter() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut results = Vec::new();
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let keep = self.call_closure(&func, &[elem.clone(), Value::int(i as i64)])?;
+                                    if keep.is_truthy() {
+                                        results.push(elem);
+                                    }
+                                }
+                                self.push(Value::array(Rc::new(RefCell::new(results))));
+                                continue;
+                            }
+                            "reduce" | "fold" => {
+                                // arr.reduce(fn, init) / arr.fold(fn, init) - 归约聚合
+                                if arg_count != 2 {
+                                    return Err(self.runtime_error("reduce() expects 2 arguments"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("reduce() first argument must be a function")
+                                })?.clone();
+                                let mut acc = self.stack[receiver_idx + 2].clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    acc = self.call_closure(&func, &[acc, elem, Value::int(i as i64)])?;
+                                }
+                                self.push(acc);
+                                continue;
+                            }
+                            "forEach" | "each" => {
+                                // arr.forEach(fn) / arr.each(fn) - 遍历执行
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("forEach() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("forEach() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                }
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "find" => {
+                                // arr.find(fn) - 查找第一个满足条件的元素
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("find() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("find() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut found = Value::null();
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let matches = self.call_closure(&func, &[elem.clone(), Value::int(i as i64)])?;
+                                    if matches.is_truthy() {
+                                        found = elem;
+                                        break;
+                                    }
+                                }
+                                self.push(found);
+                                continue;
+                            }
+                            "findIndex" => {
+                                // arr.findIndex(fn) - 查找第一个满足条件的元素索引
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("findIndex() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("findIndex() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut found_idx: i64 = -1;
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let matches = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    if matches.is_truthy() {
+                                        found_idx = i as i64;
+                                        break;
+                                    }
+                                }
+                                self.push(Value::int(found_idx));
+                                continue;
+                            }
+                            "every" | "all" => {
+                                // arr.every(fn) / arr.all(fn) - 检查所有元素是否都满足条件
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("every() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("every() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut all_pass = true;
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    if !passes.is_truthy() {
+                                        all_pass = false;
+                                        break;
+                                    }
+                                }
+                                self.push(Value::bool(all_pass));
+                                continue;
+                            }
+                            "some" | "any" => {
+                                // arr.some(fn) / arr.any(fn) - 检查是否有任一元素满足条件
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("some() expects 1 argument"));
+                                }
+                                let callback = self.stack[receiver_idx + 1].clone();
+                                let func = callback.as_function().ok_or_else(|| {
+                                    self.runtime_error("some() expects a function argument")
+                                })?.clone();
+                                let elements = arr.borrow().clone();
+                                self.stack.truncate(receiver_idx);
+                                let mut any_pass = false;
+                                for (i, elem) in elements.into_iter().enumerate() {
+                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    if passes.is_truthy() {
+                                        any_pass = true;
+                                        break;
+                                    }
+                                }
+                                self.push(Value::bool(any_pass));
+                                continue;
+                            }
+                            "sort" => {
+                                // arr.sort(fn?) - 排序（可选比较函数）
+                                if arg_count > 1 {
+                                    return Err(self.runtime_error("sort() expects 0 or 1 argument"));
+                                }
+                                let mut elements = arr.borrow().clone();
+                                if arg_count == 1 {
+                                    let callback = self.stack[receiver_idx + 1].clone();
+                                    let func = callback.as_function().ok_or_else(|| {
+                                        self.runtime_error("sort() argument must be a function")
+                                    })?.clone();
+                                    self.stack.truncate(receiver_idx);
+                                    // 使用冒泡排序来支持自定义比较函数
+                                    let len = elements.len();
+                                    for i in 0..len {
+                                        for j in 0..len - 1 - i {
+                                            let cmp = self.call_closure(&func, &[elements[j].clone(), elements[j + 1].clone()])?;
+                                            if let Some(n) = cmp.as_int() {
+                                                if n > 0 {
+                                                    elements.swap(j, j + 1);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    self.stack.truncate(receiver_idx);
+                                    // 默认排序：数字按大小，字符串按字典序
+                                    elements.sort_by(|a, b| {
+                                        if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                                            x.cmp(&y)
+                                        } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                                            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                                        } else if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
+                                            x.cmp(y)
+                                        } else {
+                                            std::cmp::Ordering::Equal
+                                        }
+                                    });
+                                }
+                                *arr.borrow_mut() = elements;
+                                self.push(Value::null());
+                                continue;
+                            }
+                            _ => {
+                                return Err(self.runtime_error(&format!(
+                                    "Array has no method '{}'",
+                                    method_name
+                                )));
+                            }
+                        }
+                    }
+                    
+                    // 检查是否是字符串方法调用
+                    if let Some(s) = receiver.as_string() {
+                        let s = s.clone();
+                        match method_name.as_str() {
+                            "len" => {
+                                // str.len() - 返回字符串长度
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("len() expects 0 arguments"));
+                                }
+                                let len = s.chars().count() as i64;
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(len));
+                                continue;
+                            }
+                            "split" => {
+                                // str.split(delimiter) - 按分隔符分割字符串
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("split() expects 1 argument"));
+                                }
+                                let delimiter = if let Some(d) = self.stack[receiver_idx + 1].as_string() {
+                                    d.clone()
+                                } else {
+                                    return Err(self.runtime_error("split() expects a string argument"));
+                                };
+                                let parts: Vec<Value> = s.split(&delimiter)
+                                    .map(|part| Value::string(part.to_string()))
+                                    .collect();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(parts))));
+                                continue;
+                            }
+                            "trim" => {
+                                // str.trim() - 去除首尾空白
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("trim() expects 0 arguments"));
+                                }
+                                let trimmed = s.trim().to_string();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(trimmed));
+                                continue;
+                            }
+                            "trimStart" => {
+                                // str.trimStart() - 去除开头空白
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("trimStart() expects 0 arguments"));
+                                }
+                                let trimmed = s.trim_start().to_string();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(trimmed));
+                                continue;
+                            }
+                            "trimEnd" => {
+                                // str.trimEnd() - 去除结尾空白
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("trimEnd() expects 0 arguments"));
+                                }
+                                let trimmed = s.trim_end().to_string();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(trimmed));
+                                continue;
+                            }
+                            "replace" => {
+                                // str.replace(old, new) - 替换所有匹配项
+                                if arg_count != 2 {
+                                    return Err(self.runtime_error("replace() expects 2 arguments"));
+                                }
+                                let old_str = if let Some(o) = self.stack[receiver_idx + 1].as_string() {
+                                    o.clone()
+                                } else {
+                                    return Err(self.runtime_error("replace() first argument must be string"));
+                                };
+                                let new_str = if let Some(n) = self.stack[receiver_idx + 2].as_string() {
+                                    n.clone()
+                                } else {
+                                    return Err(self.runtime_error("replace() second argument must be string"));
+                                };
+                                let result = s.replace(&old_str, &new_str);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "replaceFirst" => {
+                                // str.replaceFirst(old, new) - 替换第一个匹配项
+                                if arg_count != 2 {
+                                    return Err(self.runtime_error("replaceFirst() expects 2 arguments"));
+                                }
+                                let old_str = if let Some(o) = self.stack[receiver_idx + 1].as_string() {
+                                    o.clone()
+                                } else {
+                                    return Err(self.runtime_error("replaceFirst() first argument must be string"));
+                                };
+                                let new_str = if let Some(n) = self.stack[receiver_idx + 2].as_string() {
+                                    n.clone()
+                                } else {
+                                    return Err(self.runtime_error("replaceFirst() second argument must be string"));
+                                };
+                                let result = s.replacen(&old_str, &new_str, 1);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "contains" => {
+                                // str.contains(substr) - 检查是否包含子串
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("contains() expects 1 argument"));
+                                }
+                                let substr = if let Some(sub) = self.stack[receiver_idx + 1].as_string() {
+                                    sub.clone()
+                                } else {
+                                    return Err(self.runtime_error("contains() expects a string argument"));
+                                };
+                                let result = s.contains(&substr);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "startsWith" => {
+                                // str.startsWith(prefix) - 检查是否以前缀开头
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("startsWith() expects 1 argument"));
+                                }
+                                let prefix = if let Some(p) = self.stack[receiver_idx + 1].as_string() {
+                                    p.clone()
+                                } else {
+                                    return Err(self.runtime_error("startsWith() expects a string argument"));
+                                };
+                                let result = s.starts_with(&prefix);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "endsWith" => {
+                                // str.endsWith(suffix) - 检查是否以后缀结尾
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("endsWith() expects 1 argument"));
+                                }
+                                let suffix = if let Some(sf) = self.stack[receiver_idx + 1].as_string() {
+                                    sf.clone()
+                                } else {
+                                    return Err(self.runtime_error("endsWith() expects a string argument"));
+                                };
+                                let result = s.ends_with(&suffix);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "toUpper" => {
+                                // str.toUpper() - 转大写
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("toUpper() expects 0 arguments"));
+                                }
+                                let result = s.to_uppercase();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "toLower" => {
+                                // str.toLower() - 转小写
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("toLower() expects 0 arguments"));
+                                }
+                                let result = s.to_lowercase();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "charAt" => {
+                                // str.charAt(index) - 获取指定位置字符
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("charAt() expects 1 argument"));
+                                }
+                                let index = if let Some(i) = self.stack[receiver_idx + 1].as_int() {
+                                    i as usize
+                                } else {
+                                    return Err(self.runtime_error("charAt() expects an integer argument"));
+                                };
+                                let result = s.chars().nth(index)
+                                    .map(|c| Value::string(c.to_string()))
+                                    .unwrap_or(Value::null());
+                                self.stack.truncate(receiver_idx);
+                                self.push(result);
+                                continue;
+                            }
+                            "indexOf" => {
+                                // str.indexOf(substr) - 查找子串位置
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("indexOf() expects 1 argument"));
+                                }
+                                let substr = if let Some(sub) = self.stack[receiver_idx + 1].as_string() {
+                                    sub.clone()
+                                } else {
+                                    return Err(self.runtime_error("indexOf() expects a string argument"));
+                                };
+                                let result = s.find(&substr)
+                                    .map(|i| Value::int(i as i64))
+                                    .unwrap_or(Value::int(-1));
+                                self.stack.truncate(receiver_idx);
+                                self.push(result);
+                                continue;
+                            }
+                            "lastIndexOf" => {
+                                // str.lastIndexOf(substr) - 查找最后一个子串位置
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("lastIndexOf() expects 1 argument"));
+                                }
+                                let substr = if let Some(sub) = self.stack[receiver_idx + 1].as_string() {
+                                    sub.clone()
+                                } else {
+                                    return Err(self.runtime_error("lastIndexOf() expects a string argument"));
+                                };
+                                let result = s.rfind(&substr)
+                                    .map(|i| Value::int(i as i64))
+                                    .unwrap_or(Value::int(-1));
+                                self.stack.truncate(receiver_idx);
+                                self.push(result);
+                                continue;
+                            }
+                            "substring" => {
+                                // str.substring(start, end?) - 截取子串
+                                if arg_count < 1 || arg_count > 2 {
+                                    return Err(self.runtime_error("substring() expects 1 or 2 arguments"));
+                                }
+                                let start = if let Some(i) = self.stack[receiver_idx + 1].as_int() {
+                                    i as usize
+                                } else {
+                                    return Err(self.runtime_error("substring() first argument must be integer"));
+                                };
+                                let end = if arg_count == 2 {
+                                    if let Some(i) = self.stack[receiver_idx + 2].as_int() {
+                                        i as usize
+                                    } else {
+                                        return Err(self.runtime_error("substring() second argument must be integer"));
+                                    }
+                                } else {
+                                    s.chars().count()
+                                };
+                                let result: String = s.chars().skip(start).take(end - start).collect();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "repeat" => {
+                                // str.repeat(n) - 重复字符串
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("repeat() expects 1 argument"));
+                                }
+                                let n = if let Some(i) = self.stack[receiver_idx + 1].as_int() {
+                                    i as usize
+                                } else {
+                                    return Err(self.runtime_error("repeat() expects an integer argument"));
+                                };
+                                let result = s.repeat(n);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            "isEmpty" => {
+                                // str.isEmpty() - 检查是否为空
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("isEmpty() expects 0 arguments"));
+                                }
+                                let result = s.is_empty();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "reverse" => {
+                                // str.reverse() - 反转字符串
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("reverse() expects 0 arguments"));
+                                }
+                                let result: String = s.chars().rev().collect();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::string(result));
+                                continue;
+                            }
+                            _ => {
+                                return Err(self.runtime_error(&format!(
+                                    "String has no method '{}'",
+                                    method_name
+                                )));
+                            }
+                        }
+                    }
+                    
+                    // 检查是否是 Map 方法调用
+                    if let Some(map) = receiver.as_map() {
+                        match method_name.as_str() {
+                            "len" => {
+                                // map.len() - 返回键值对数量
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("len() expects 0 arguments"));
+                                }
+                                let len = map.borrow().len() as i64;
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(len));
+                                continue;
+                            }
+                            "keys" => {
+                                // map.keys() - 返回所有键的数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("keys() expects 0 arguments"));
+                                }
+                                let keys: Vec<Value> = map.borrow().keys()
+                                    .map(|k| Value::string(k.clone()))
+                                    .collect();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(keys))));
+                                continue;
+                            }
+                            "values" => {
+                                // map.values() - 返回所有值的数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("values() expects 0 arguments"));
+                                }
+                                let values: Vec<Value> = map.borrow().values().cloned().collect();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(values))));
+                                continue;
+                            }
+                            "has" => {
+                                // map.has(key) - 检查键是否存在
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("has() expects 1 argument"));
+                                }
+                                let key = if let Some(s) = self.stack[receiver_idx + 1].as_string() {
+                                    s.clone()
+                                } else {
+                                    return Err(self.runtime_error("Map key must be a string"));
+                                };
+                                let result = map.borrow().contains_key(&key);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "get" => {
+                                // map.get(key, default?) - 获取值，可选默认值
+                                if arg_count < 1 || arg_count > 2 {
+                                    return Err(self.runtime_error("get() expects 1 or 2 arguments"));
+                                }
+                                let key = if let Some(s) = self.stack[receiver_idx + 1].as_string() {
+                                    s.clone()
+                                } else {
+                                    return Err(self.runtime_error("Map key must be a string"));
+                                };
+                                let default = if arg_count == 2 {
+                                    self.stack[receiver_idx + 2]
+                                } else {
+                                    Value::null()
+                                };
+                                let result = map.borrow().get(&key).cloned().unwrap_or(default);
+                                self.stack.truncate(receiver_idx);
+                                self.push(result);
+                                continue;
+                            }
+                            "set" => {
+                                // map.set(key, value) - 设置键值对
+                                if arg_count != 2 {
+                                    return Err(self.runtime_error("set() expects 2 arguments"));
+                                }
+                                let key = if let Some(s) = self.stack[receiver_idx + 1].as_string() {
+                                    s.clone()
+                                } else {
+                                    return Err(self.runtime_error("Map key must be a string"));
+                                };
+                                let value = self.stack[receiver_idx + 2];
+                                map.borrow_mut().insert(key, value);
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "remove" => {
+                                // map.remove(key) - 删除键值对，返回被删除的值
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("remove() expects 1 argument"));
+                                }
+                                let key = if let Some(s) = self.stack[receiver_idx + 1].as_string() {
+                                    s.clone()
+                                } else {
+                                    return Err(self.runtime_error("Map key must be a string"));
+                                };
+                                let removed = map.borrow_mut().remove(&key).unwrap_or(Value::null());
+                                self.stack.truncate(receiver_idx);
+                                self.push(removed);
+                                continue;
+                            }
+                            "clear" => {
+                                // map.clear() - 清空所有键值对
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("clear() expects 0 arguments"));
+                                }
+                                map.borrow_mut().clear();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::null());
+                                continue;
+                            }
+                            "isEmpty" => {
+                                // map.isEmpty() - 检查是否为空
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("isEmpty() expects 0 arguments"));
+                                }
+                                let result = map.borrow().is_empty();
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            _ => {
+                                return Err(self.runtime_error(&format!(
+                                    "Map has no method '{}'",
+                                    method_name
+                                )));
+                            }
+                        }
+                    }
+                    
+                    // 检查是否是 Range 方法调用
+                    if let Some((start, end, inclusive)) = receiver.as_range() {
+                        
+                        match method_name.as_str() {
+                            "start" => {
+                                // range.start() - 返回起始值
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("start() expects 0 arguments"));
+                                }
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(start));
+                                continue;
+                            }
+                            "end" => {
+                                // range.end() - 返回结束值
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("end() expects 0 arguments"));
+                                }
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(end));
+                                continue;
+                            }
+                            "len" => {
+                                // range.len() - 返回范围长度
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("len() expects 0 arguments"));
+                                }
+                                let len = if inclusive {
+                                    (end - start + 1).max(0)
+                                } else {
+                                    (end - start).max(0)
+                                };
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::int(len));
+                                continue;
+                            }
+                            "contains" => {
+                                // range.contains(value) - 检查是否包含值
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("contains() expects 1 argument"));
+                                }
+                                let value = if let Some(v) = self.stack[receiver_idx + 1].as_int() {
+                                    v
+                                } else {
+                                    return Err(self.runtime_error("contains() expects an integer argument"));
+                                };
+                                let result = if inclusive {
+                                    value >= start && value <= end
+                                } else {
+                                    value >= start && value < end
+                                };
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(result));
+                                continue;
+                            }
+                            "toArray" => {
+                                // range.toArray() - 转换为数组
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("toArray() expects 0 arguments"));
+                                }
+                                let arr: Vec<Value> = if inclusive {
+                                    (start..=end).map(Value::int).collect()
+                                } else {
+                                    (start..end).map(Value::int).collect()
+                                };
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(arr))));
+                                continue;
+                            }
+                            "isInclusive" => {
+                                // range.isInclusive() - 是否是包含范围
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("isInclusive() expects 0 arguments"));
+                                }
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(inclusive));
+                                continue;
+                            }
+                            "isEmpty" => {
+                                // range.isEmpty() - 是否为空范围
+                                if arg_count != 0 {
+                                    return Err(self.runtime_error("isEmpty() expects 0 arguments"));
+                                }
+                                let empty = if inclusive {
+                                    start > end
+                                } else {
+                                    start >= end
+                                };
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::bool(empty));
+                                continue;
+                            }
+                            "step" => {
+                                // range.step(n) - 返回带步长的迭代数组
+                                if arg_count != 1 {
+                                    return Err(self.runtime_error("step() expects 1 argument"));
+                                }
+                                let step_val = if let Some(s) = self.stack[receiver_idx + 1].as_int() {
+                                    s
+                                } else {
+                                    return Err(self.runtime_error("step() expects an integer argument"));
+                                };
+                                if step_val <= 0 {
+                                    return Err(self.runtime_error("step() argument must be positive"));
+                                }
+                                let mut arr = Vec::new();
+                                let mut i = start;
+                                let limit = if inclusive { end + 1 } else { end };
+                                while i < limit {
+                                    arr.push(Value::int(i));
+                                    i += step_val;
+                                }
+                                self.stack.truncate(receiver_idx);
+                                self.push(Value::array(Rc::new(RefCell::new(arr))));
+                                continue;
+                            }
+                            _ => {
+                                return Err(self.runtime_error(&format!(
+                                    "Range has no method '{}'",
+                                    method_name
+                                )));
+                            }
+                        }
+                    }
+                    
+                    // 获取类型名和方法
+                    let type_name = if let Some(s) = receiver.as_struct() {
+                        s.borrow().type_name.clone()
+                    } else if let Some(c) = receiver.as_class() {
+                        c.borrow().class_name.clone()
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot call method '{}' on {}",
+                            method_name,
+                            receiver.type_name()
+                        )));
+                    };
+                    
+                    // 查找方法
+                    let func_index = match self.chunk.get_method(&type_name, &method_name) {
+                        Some(idx) => idx as usize,
+                        None => return Err(self.runtime_error(&format!(
+                            "Type '{}' has no method '{}'",
+                            type_name, method_name
+                        ))),
+                    };
+                    
+                    // 获取函数对象
+                    let func = if let Some(f) = self.chunk.constants[func_index].as_function() {
+                        f.clone()
+                    } else {
+                        return Err(self.runtime_error("Method is not a function"));
+                    };
+                    
+                    // 检查参数数量（+1 是因为 this 作为第一个参数）
+                    let _expected_args = func.arity;
+                    let actual_args = arg_count + 1; // receiver + args
+                    
+                    if actual_args < func.required_params {
+                        let msg = format!(
+                            "Method '{}' expected at least {} arguments but got {}",
+                            method_name, func.required_params - 1, arg_count
+                        );
+                        return Err(self.runtime_error(&msg));
+                    }
+                    
+                    if !func.has_variadic && actual_args > func.arity {
+                        let msg = format!(
+                            "Method '{}' expected at most {} arguments but got {}",
+                            method_name, func.arity - 1, arg_count
+                        );
+                        return Err(self.runtime_error(&msg));
+                    }
+                    
+                    // 处理默认参数
+                    let fixed_params = if func.has_variadic { func.arity - 1 } else { func.arity };
+                    let missing_count = fixed_params.saturating_sub(actual_args);
+                    if missing_count > 0 && !func.defaults.is_empty() {
+                        let defaults_start = func.defaults.len().saturating_sub(missing_count);
+                        for i in 0..missing_count {
+                            if defaults_start + i < func.defaults.len() {
+                                self.push(func.defaults[defaults_start + i].clone());
+                            }
+                        }
+                    }
+                    
+                    // 检查调用深度
+                    if self.frames.len() >= MAX_FRAMES {
+                        let msg = "Stack overflow: too many nested function calls";
+                        return Err(self.runtime_error(msg));
+                    }
+                    
+                    // receiver 已经在栈上正确位置（在参数下方）
+                    // 创建调用帧：base_slot 指向 receiver 位置
+                    let frame = CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: receiver_idx as u16, // receiver 作为第一个局部变量 (this)
+                        is_method_call: true, // 实例方法调用
+                    };
+                    self.frames.push(frame);
+                    
+                    // 跳转到方法体
+                    self.ip = func.chunk_index;
+                }
+                
+                OpCode::NewClass => {
+                    let class_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 获取类名
+                    let class_name = if let Some(s) = self.chunk.constants[class_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid class name"));
+                    };
+                    
+                    // 获取类型信息
+                    let type_info = match self.chunk.get_type(&class_name) {
+                        Some(t) => t.clone(),
+                        None => return Err(self.runtime_error(&format!(
+                            "Undefined class: {}", class_name
+                        ))),
+                    };
+                    
+                    // 检查是否是抽象类
+                    if type_info.is_abstract {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot instantiate abstract class '{}'", class_name
+                        )));
+                    }
+                    
+                    // 创建实例，初始化字段为 null
+                    let mut fields = std::collections::HashMap::new();
+                    for field_name in &type_info.fields {
+                        fields.insert(field_name.clone(), Value::null());
+                    }
+                    
+                    let instance = super::value::ClassInstance {
+                        class_name: class_name.clone(),
+                        parent_class: type_info.parent.clone(),
+                        fields,
+                    };
+                    let instance_value = Value::class(Rc::new(std::cell::RefCell::new(instance)));
+                    
+                    // 查找 init 构造函数
+                    if let Some(init_index) = type_info.methods.get("init") {
+                        let init_func = if let Some(f) = self.chunk.constants[*init_index as usize].as_function() {
+                            f.clone()
+                        } else {
+                            return Err(self.runtime_error("init is not a function"));
+                        };
+                        
+                        // 检查参数数量
+                        let expected_args = init_func.arity - 1; // -1 因为 this 是隐式参数
+                        if arg_count < init_func.required_params - 1 {
+                            let msg = format!(
+                                "Constructor expected at least {} arguments but got {}",
+                                init_func.required_params - 1, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                        if !init_func.has_variadic && arg_count > expected_args {
+                            let msg = format!(
+                                "Constructor expected at most {} arguments but got {}",
+                                expected_args, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                        // 将实例插入到参数下方（作为 this）
+                        // 当前栈: [..., arg1, arg2, ..., argN]
+                        // 目标栈: [..., instance, arg1, arg2, ..., argN]
+                        let insert_pos = self.stack.len() - arg_count;
+                        self.stack.insert(insert_pos, instance_value.clone());
+                        
+                        // 处理默认参数
+                        let fixed_params = if init_func.has_variadic { init_func.arity - 1 } else { init_func.arity };
+                        let actual_args = arg_count + 1; // +1 for this
+                        let missing_count = fixed_params.saturating_sub(actual_args);
+                        if missing_count > 0 && !init_func.defaults.is_empty() {
+                            let defaults_start = init_func.defaults.len().saturating_sub(missing_count);
+                            for i in 0..missing_count {
+                                if defaults_start + i < init_func.defaults.len() {
+                                    self.push(init_func.defaults[defaults_start + i].clone());
+                                }
+                            }
+                        }
+                        
+                        // 检查调用深度
+                        if self.frames.len() >= MAX_FRAMES {
+                            return Err(self.runtime_error("Stack overflow: too many nested calls"));
+                        }
+                        
+                        // 创建调用帧
+                        let frame = CallFrame {
+                            return_ip: self.ip as u32,
+                            base_slot: insert_pos as u16,
+                            is_method_call: true, // init 方法调用
+                        };
+                        self.frames.push(frame);
+                        
+                        // 跳转到 init 方法
+                        self.ip = init_func.chunk_index;
+                    } else {
+                        // 没有 init 方法，直接返回实例
+                        // 但需要弹出传入的参数
+                        for _ in 0..arg_count {
+                            self.pop()?;
+                        }
+                        self.push(instance_value);
+                    }
+                }
+                
+                OpCode::GetStatic => {
+                    let class_name_index = self.read_u16() as usize;
+                    let field_name_index = self.read_u16() as usize;
+                    
+                    let class_name = if let Some(s) = self.chunk.constants[class_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid class name"));
+                    };
+                    
+                    let field_name = if let Some(s) = self.chunk.constants[field_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid field name"));
+                    };
+                    
+                    // 这里简化处理，静态字段需要在运行时存储
+                    // 目前返回 null 作为占位符
+                    let _type_info = self.chunk.get_type(&class_name);
+                    self.push(Value::null());
+                    let _ = field_name; // 避免警告
+                }
+                
+                OpCode::SetStatic => {
+                    let _class_name_index = self.read_u16();
+                    let _field_name_index = self.read_u16();
+                    // 静态字段设置 - 简化实现
+                }
+                
+                OpCode::InvokeStatic => {
+                    let class_name_index = self.read_u16() as usize;
+                    let method_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    let class_name = if let Some(s) = self.chunk.constants[class_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid class name"));
+                    };
+                    
+                    let method_name = if let Some(s) = self.chunk.constants[method_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid method name"));
+                    };
+                    
+                    // 查找静态方法
+                    let func_index = match self.chunk.get_static_method(&class_name, &method_name) {
+                        Some(idx) => idx as usize,
+                        None => return Err(self.runtime_error(&format!(
+                            "Class '{}' has no static method '{}'",
+                            class_name, method_name
+                        ))),
+                    };
+                    
+                    let func = if let Some(f) = self.chunk.constants[func_index].as_function() {
+                        f.clone()
+                    } else {
+                        return Err(self.runtime_error("Static method is not a function"));
+                    };
+                    
+                    // 检查参数
+                    if arg_count < func.required_params {
+                        let msg = format!(
+                            "Static method '{}' expected at least {} arguments but got {}",
+                            method_name, func.required_params, arg_count
+                        );
+                        return Err(self.runtime_error(&msg));
+                    }
+                    
+                    // 创建调用帧
+                    let base = self.stack.len() - arg_count;
+                    
+                    // 填充默认参数
+                    let missing = func.arity.saturating_sub(arg_count);
+                    if missing > 0 && !func.defaults.is_empty() {
+                        let start = func.defaults.len().saturating_sub(missing);
+                        for i in 0..missing {
+                            if start + i < func.defaults.len() {
+                                self.push(func.defaults[start + i].clone());
+                            }
+                        }
+                    }
+                    
+                    if self.frames.len() >= MAX_FRAMES {
+                        return Err(self.runtime_error("Stack overflow"));
+                    }
+                    
+                    // 静态方法不需要在栈上插入函数值，直接使用参数位置
+                    let frame = CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: base as u16,
+                        is_method_call: true, // 没有函数值在栈上，类似方法调用
+                    };
+                    self.frames.push(frame);
+                    self.ip = func.chunk_index;
+                }
+                
+                OpCode::InvokeSuper => {
+                    let method_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    let method_name = if let Some(s) = self.chunk.constants[method_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid method name"));
+                    };
+                    
+                    // 获取 this（在参数下方）
+                    let receiver_idx = self.stack.len() - arg_count - 1;
+                    let receiver = self.stack[receiver_idx].clone();
+                    
+                    // 获取父类名
+                    let parent_class = if let Some(c) = receiver.as_class() {
+                        c.borrow().parent_class.clone()
+                    } else {
+                        return Err(self.runtime_error("super can only be used in a class method"));
+                    };
+                    
+                    let parent_name = match parent_class {
+                        Some(name) => name,
+                        None => return Err(self.runtime_error("Class has no parent")),
+                    };
+                    
+                    // 查找父类方法
+                    let func_index = match self.chunk.get_method(&parent_name, &method_name) {
+                        Some(idx) => idx as usize,
+                        None => return Err(self.runtime_error(&format!(
+                            "Parent class '{}' has no method '{}'",
+                            parent_name, method_name
+                        ))),
+                    };
+                    
+                    let func = if let Some(f) = self.chunk.constants[func_index].as_function() {
+                        f.clone()
+                    } else {
+                        return Err(self.runtime_error("Method is not a function"));
+                    };
+                    
+                    if self.frames.len() >= MAX_FRAMES {
+                        return Err(self.runtime_error("Stack overflow"));
+                    }
+                    
+                    let frame = CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: receiver_idx as u16,
+                        is_method_call: true, // super 方法调用
+                    };
+                    self.frames.push(frame);
+                    self.ip = func.chunk_index;
+                }
+                
+                OpCode::Dup => {
+                    let value = self.peek()?.clone();
+                    self.push(value);
+                }
+                
+                OpCode::SetupTry => {
+                    // 读取 catch 块的偏移量
+                    let catch_offset = self.read_u16() as i16;
+                    // 记录异常处理器（当前 IP + 偏移量 = catch 块地址）
+                    // 注意：这里需要更完整的实现，使用异常处理器栈
+                    // 暂时存储在一个简单的字段中
+                    let catch_ip = (self.ip as i32 + catch_offset as i32) as usize;
+                    self.exception_handlers.push(ExceptionHandler {
+                        catch_ip,
+                        stack_depth: self.stack.len(),
+                        frame_depth: self.frames.len(),
+                    });
+                }
+                
+                OpCode::Throw => {
+                    // 弹出异常值
+                    let exception = self.pop()?;
+                    
+                    // 查找最近的异常处理器
+                    if let Some(handler) = self.exception_handlers.pop() {
+                        // 恢复栈到处理器设置时的深度
+                        self.stack.truncate(handler.stack_depth);
+                        // 恢复调用帧
+                        while self.frames.len() > handler.frame_depth {
+                            self.frames.pop();
+                        }
+                        // 压入异常值（供 catch 块使用）
+                        self.push(exception);
+                        // 跳转到 catch 块
+                        self.ip = handler.catch_ip;
+                    } else {
+                        // 没有异常处理器，返回错误
+                        return Err(self.runtime_error(&format!("Uncaught exception: {}", exception)));
+                    }
+                }
+                
+                OpCode::Halt => {
+                    return Ok(());
+                }
+                
+                // ============ 专用整数指令 (性能优化) ============
+                OpCode::AddInt => {
+                    // 无类型检查的整数加法
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    // SAFETY: 编译器保证这里一定是整数
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(x + y));
+                }
+                
+                OpCode::SubInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(x - y));
+                }
+                
+                OpCode::MulInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(x * y));
+                }
+                
+                OpCode::DivInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    if y == 0 {
+                        return Err(self.runtime_error("Division by zero"));
+                    }
+                    self.push_fast(Value::int(x / y));
+                }
+                
+                OpCode::LtInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x < y));
+                }
+                
+                OpCode::LeInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x <= y));
+                }
+                
+                OpCode::GtInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x > y));
+                }
+                
+                OpCode::GeInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x >= y));
+                }
+                
+                OpCode::EqInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x == y));
+                }
+                
+                OpCode::NeInt => {
+                    let b = self.pop_fast();
+                    let a = self.pop_fast();
+                    let x = unsafe { a.as_int().unwrap_unchecked() };
+                    let y = unsafe { b.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(x != y));
+                }
+                
+                // ============ 融合指令 ============
+                OpCode::ConstInt8 => {
+                    // 加载小整数常量
+                    let value = self.read_byte() as i8 as i64;
+                    self.push_fast(Value::int(value));
+                }
+                
+                OpCode::GetLocalInt => {
+                    // 获取局部整数变量 (无类型检查)
+                    let slot = self.read_u16() as usize;
+                    let actual_slot = self.current_base + slot;
+                    let value = unsafe { self.stack.get_unchecked(actual_slot).clone() };
+                    self.push_fast(value);
+                }
+                
+                OpCode::GetLocalAddInt => {
+                    // 获取局部变量并加整数
+                    let slot = self.read_u16() as usize;
+                    let add_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(n + add_value));
+                }
+                
+                OpCode::GetLocalSubInt => {
+                    // 获取局部变量并减整数
+                    let slot = self.read_u16() as usize;
+                    let sub_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(n - sub_value));
+                }
+                
+                OpCode::JumpIfFalsePop => {
+                    // 条件跳转并弹出
+                    let offset = self.read_u16() as usize;
+                    let condition = self.pop_fast();
+                    if !condition.is_truthy() {
+                        self.ip += offset;
+                    }
+                }
+                
+                OpCode::TailCall => {
+                    // 尾调用优化：复用当前调用帧
+                    let arg_count = self.read_byte() as usize;
+                    
+                    let callee_idx = self.stack.len() - arg_count - 1;
+                    let callee = self.stack[callee_idx].clone();
+                    
+                    if let Some(func) = callee.as_function() {
+                        // 将参数移动到当前帧的基址位置
+                        let current_base: usize = if self.frames.is_empty() {
+                            0
+                        } else {
+                            self.frames.last().unwrap().base_slot as usize
+                        };
+                        
+                        // 移动参数到正确位置
+                        for i in 0..arg_count {
+                            let arg = self.stack[callee_idx + 1 + i].clone();
+                            self.stack[current_base + i] = arg;
+                        }
+                        
+                        // 截断栈
+                        self.stack.truncate(current_base + arg_count);
+                        
+                        // 直接跳转到函数体，不创建新帧
+                        self.ip = func.chunk_index;
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot call {}", callee.type_name())));
+                    }
+                }
+                
+                OpCode::DecInt => {
+                    // 整数递减：x - 1
+                    let top = self.pop_fast();
+                    let n = unsafe { top.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::int(n - 1));
+                }
+                
+                OpCode::GetLocalLeInt => {
+                    // 获取局部变量并与整数比较小于等于
+                    let slot = self.read_u16() as usize;
+                    let cmp_value = self.read_byte() as i8 as i64;
+                    let actual_slot = self.current_base + slot;
+                    let local = unsafe { self.stack.get_unchecked(actual_slot) };
+                    let n = unsafe { local.as_int().unwrap_unchecked() };
+                    self.push_fast(Value::bool(n <= cmp_value));
+                }
+                
+                OpCode::ReturnIf => {
+                    // 如果条件为真，返回值
+                    let condition = self.pop_fast();
+                    if condition.is_truthy() {
+                        let return_value = self.pop_fast();
+                        
+                        if self.frames.is_empty() {
+                            self.push_fast(return_value);
+                            return Ok(());
+                        }
+                        
+                        let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                        let truncate_to = if frame.is_method_call {
+                            frame.base_slot as usize
+                        } else {
+                            (frame.base_slot as usize).saturating_sub(1)
+                        };
+                        self.stack.truncate(truncate_to);
+                        self.push_fast(return_value);
+                        self.ip = frame.return_ip as usize;
+                        self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+    
+    /// 查看栈顶值（不弹出）
+    fn peek(&self) -> Result<&Value, RuntimeError> {
+        self.stack.last().ok_or_else(|| {
+            let msg = format_message(messages::ERR_RUNTIME_STACK_UNDERFLOW, self.locale, &[]);
+            self.runtime_error(&msg)
+        })
+    }
+
+    /// 读取一个字节
+    #[inline(always)]
+    fn read_byte(&mut self) -> u8 {
+        // SAFETY: 编译器保证 ip 在有效范围内
+        let byte = unsafe { *self.chunk.code.get_unchecked(self.ip) };
+        self.ip += 1;
+        byte
+    }
+
+    /// 读取一个 u16（大端序）
+    #[inline(always)]
+    fn read_u16(&mut self) -> u16 {
+        // SAFETY: 编译器保证 ip+1 在有效范围内
+        unsafe {
+            let high = *self.chunk.code.get_unchecked(self.ip) as u16;
+            let low = *self.chunk.code.get_unchecked(self.ip + 1) as u16;
+            self.ip += 2;
+        (high << 8) | low
+        }
+    }
+
+    /// 压栈
+    #[inline(always)]
+    fn push(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
+    /// 出栈
+    #[inline(always)]
+    fn pop(&mut self) -> Result<Value, RuntimeError> {
+        self.stack.pop().ok_or_else(|| {
+            let msg = format_message(messages::ERR_RUNTIME_STACK_UNDERFLOW, self.locale, &[]);
+            self.runtime_error(&msg)
+        })
+    }
+    
+    /// 快速出栈（无检查，仅在确定栈非空时使用）
+    #[inline(always)]
+    fn pop_fast(&mut self) -> Value {
+        // SAFETY: 调用者保证栈非空
+        unsafe { self.stack.pop().unwrap_unchecked() }
+    }
+    
+    /// 快速入栈
+    #[inline(always)]
+    fn push_fast(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+
+    /// 创建运行时错误
+    fn runtime_error(&self, message: &str) -> RuntimeError {
+        let line = self.chunk.get_line(self.ip.saturating_sub(1));
+        RuntimeError::new(message.to_string(), line)
+    }
+    
+    /// 调用闭包函数并返回结果
+    /// 用于高阶数组方法（map、filter、reduce 等）
+    fn call_closure(&mut self, func: &Rc<Function>, args: &[Value]) -> Result<Value, RuntimeError> {
+        // 检查参数数量
+        let provided = args.len();
+        let expected = func.arity;
+        
+        // 保存当前状态
+        let saved_ip = self.ip;
+        let saved_base = self.current_base;
+        
+        // 压入函数值（占位，不实际使用）
+        let callee_idx = self.stack.len();
+        self.push_fast(Value::null());
+        
+        // 压入参数
+        let base_slot = callee_idx + 1;
+        let args_to_push = provided.min(expected);
+        for i in 0..args_to_push {
+            self.push_fast(args[i].clone());
+        }
+        
+        // 填充缺失参数为 null
+        for _ in args_to_push..expected {
+            self.push_fast(Value::null());
+        }
+        
+        // 检查调用深度
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(self.runtime_error("Stack overflow in closure call"));
+        }
+        
+        // 创建调用帧
+        self.frames.push(CallFrame {
+            return_ip: saved_ip as u32,
+            base_slot: base_slot as u16,
+            is_method_call: false,
+        });
+        self.current_base = base_slot;
+        
+        // 跳转到函数体
+        self.ip = func.chunk_index;
+        
+        // 执行直到返回
+        self.run_until_return()?;
+        
+        // 获取返回值
+        let result = self.pop_fast();
+        
+        // 恢复状态（移除占位的函数值）
+        self.stack.truncate(callee_idx);
+        self.current_base = saved_base;
+        self.ip = saved_ip;
+        
+        Ok(result)
+    }
+    
+    /// 执行直到当前帧返回
+    fn run_until_return(&mut self) -> Result<(), RuntimeError> {
+        let target_frame_depth = self.frames.len() - 1;
+        
+        loop {
+            let op = self.read_byte();
+            
+            // 检查是否是返回指令
+            if op == 82 { // OpCode::Return
+                let return_value = self.pop_fast();
+                
+                // 弹出调用帧
+                let frame = unsafe { self.frames.pop().unwrap_unchecked() };
+                let truncate_to = if frame.is_method_call {
+                    frame.base_slot as usize
+                } else {
+                    (frame.base_slot as usize).saturating_sub(1)
+                };
+                self.stack.truncate(truncate_to);
+                self.push_fast(return_value);
+                
+                // 恢复指令指针
+                self.ip = frame.return_ip as usize;
+                self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                
+                // 检查是否回到目标帧
+                if self.frames.len() <= target_frame_depth {
+                    return Ok(());
+                }
+                continue;
+            }
+            
+            // 其他指令回退让主循环处理
+            self.ip -= 1;
+            
+            // 执行单条指令
+            self.execute_single_instruction()?;
+            
+            // 检查帧深度
+            if self.frames.len() <= target_frame_depth {
+                return Ok(());
+            }
+        }
+    }
+    
+    /// 执行单条指令（用于闭包内部调用）
+    fn execute_single_instruction(&mut self) -> Result<(), RuntimeError> {
+        let op = self.read_byte();
+        let opcode = OpCode::from(op);
+        
+        match opcode {
+            OpCode::ConstInt8 => {
+                let value = self.read_byte() as i8 as i64;
+                self.push_fast(Value::int(value));
+            }
+            OpCode::GetLocal | OpCode::GetLocalInt => {
+                let slot = self.read_u16() as usize;
+                let actual_slot = self.current_base + slot;
+                let value = unsafe { self.stack.get_unchecked(actual_slot).clone() };
+                self.push_fast(value);
+            }
+            OpCode::SetLocal => {
+                let slot = self.read_u16() as usize;
+                let value = self.peek()?.clone();
+                let actual_slot = self.current_base + slot;
+                self.stack[actual_slot] = value;
+            }
+            OpCode::Const => {
+                let index = self.read_u16() as usize;
+                let value = unsafe { self.chunk.constants.get_unchecked(index).clone() };
+                self.push_fast(value);
+            }
+            OpCode::Pop => {
+                self.pop()?;
+            }
+            OpCode::AddInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::int(x + y));
+            }
+            OpCode::SubInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::int(x - y));
+            }
+            OpCode::MulInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::int(x * y));
+            }
+            OpCode::LeInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(x <= y));
+            }
+            OpCode::LtInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(x < y));
+            }
+            OpCode::GtInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(x > y));
+            }
+            OpCode::GeInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(x >= y));
+            }
+            OpCode::EqInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = unsafe { a.as_int().unwrap_unchecked() };
+                let y = unsafe { b.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(x == y));
+            }
+            OpCode::Add => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x + y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::float(x + y));
+                } else {
+                    let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Sub => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x - y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::float(x - y));
+                } else {
+                    let result = (a - b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Mul => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x * y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::float(x * y));
+                } else {
+                    let result = (a * b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Div => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    if y == 0 {
+                        return Err(self.runtime_error("Division by zero"));
+                    }
+                    self.push_fast(Value::int(x / y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::float(x / y));
+                } else {
+                    let result = (a / b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Mod => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    if y == 0 {
+                        return Err(self.runtime_error("Modulo by zero"));
+                    }
+                    self.push_fast(Value::int(x % y));
+                } else {
+                    let result = (a % b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Lt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x < y));
+                } else {
+                    let result = a.lt(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Le => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x <= y));
+                } else {
+                    let result = a.le(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Gt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x > y));
+                } else {
+                    let result = a.gt(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Ge => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x >= y));
+                } else {
+                    let result = a.ge(&b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Eq => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                self.push_fast(a.eq_value(&b));
+            }
+            OpCode::Ne => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                self.push_fast(a.ne_value(&b));
+            }
+            OpCode::Not => {
+                let a = self.pop_fast();
+                self.push_fast(a.not());
+            }
+            OpCode::Neg => {
+                let a = self.pop_fast();
+                if let Some(x) = a.as_int() {
+                    self.push_fast(Value::int(-x));
+                } else if let Some(x) = a.as_float() {
+                    self.push_fast(Value::float(-x));
+                } else {
+                    let result = (-a).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Jump => {
+                let offset = self.read_u16() as usize;
+                self.ip += offset;
+            }
+            OpCode::JumpIfFalse => {
+                let offset = self.read_u16() as usize;
+                let top = unsafe { self.stack.last().unwrap_unchecked() };
+                if !top.is_truthy() {
+                    self.ip += offset;
+                }
+            }
+            OpCode::JumpIfFalsePop => {
+                let offset = self.read_u16() as usize;
+                let condition = self.pop_fast();
+                if !condition.is_truthy() {
+                    self.ip += offset;
+                }
+            }
+            OpCode::JumpIfTrue => {
+                let offset = self.read_u16() as usize;
+                let top = unsafe { self.stack.last().unwrap_unchecked() };
+                if top.is_truthy() {
+                    self.ip += offset;
+                }
+            }
+            OpCode::Loop => {
+                let offset = self.read_u16() as usize;
+                self.ip -= offset;
+            }
+            OpCode::GetLocalAddInt => {
+                let slot = self.read_u16() as usize;
+                let add_value = self.read_byte() as i8 as i64;
+                let actual_slot = self.current_base + slot;
+                let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                self.push_fast(Value::int(n + add_value));
+            }
+            OpCode::GetLocalSubInt => {
+                let slot = self.read_u16() as usize;
+                let sub_value = self.read_byte() as i8 as i64;
+                let actual_slot = self.current_base + slot;
+                let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
+                let n = unsafe { base_value.as_int().unwrap_unchecked() };
+                self.push_fast(Value::int(n - sub_value));
+            }
+            OpCode::GetLocalLeInt => {
+                let slot = self.read_u16() as usize;
+                let cmp_value = self.read_byte() as i8 as i64;
+                let actual_slot = self.current_base + slot;
+                let local = unsafe { self.stack.get_unchecked(actual_slot) };
+                let n = unsafe { local.as_int().unwrap_unchecked() };
+                self.push_fast(Value::bool(n <= cmp_value));
+            }
+            OpCode::Call => {
+                let arg_count = self.read_byte() as usize;
+                let callee_idx = self.stack.len() - arg_count - 1;
+                let callee = self.stack[callee_idx].clone();
+                
+                if let Some(func) = callee.as_function() {
+                    if self.frames.len() >= MAX_FRAMES {
+                        return Err(self.runtime_error("Stack overflow"));
+                    }
+                    let base_slot = callee_idx + 1;
+                    self.frames.push(CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: base_slot as u16,
+                        is_method_call: false,
+                    });
+                    self.current_base = base_slot;
+                    self.ip = func.chunk_index;
+                } else {
+                    return Err(self.runtime_error(&format!("Cannot call {}", callee.type_name())));
+                }
+            }
+            OpCode::Return => {
+                // 由 run_until_return 处理
+                self.ip -= 1;
+            }
+            OpCode::Print => {
+                let value = self.pop_fast();
+                print!("{}", value);
+                self.push_fast(Value::null());
+            }
+            OpCode::PrintLn => {
+                let value = self.pop_fast();
+                println!("{}", value);
+                self.push_fast(Value::null());
+            }
+            _ => {
+                // 其他指令暂不支持在闭包中使用
+                return Err(self.runtime_error(&format!("Unsupported opcode {:?} in closure", opcode)));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 尝试将值转换为指定类型，失败返回 null
+    fn try_cast_value(&self, value: Value, target_type: &str) -> Value {
+        match target_type {
+            "int" => {
+                if let Some(n) = value.as_int() {
+                    Value::int(n)
+                } else if let Some(f) = value.as_float() {
+                    Value::int(f as i64)
+                } else if let Some(b) = value.as_bool() {
+                    Value::int(if b { 1 } else { 0 })
+                } else if let Some(s) = value.as_string() {
+                    s.parse::<i64>().map(Value::int).unwrap_or(Value::null())
+                } else if let Some(c) = value.as_char() {
+                    Value::int(c as i64)
+                } else {
+                    Value::null()
+                }
+            },
+            "float" | "f64" => {
+                if let Some(f) = value.as_float() {
+                    Value::float(f)
+                } else if let Some(n) = value.as_int() {
+                    Value::float(n as f64)
+                } else if let Some(s) = value.as_string() {
+                    s.parse::<f64>().map(Value::float).unwrap_or(Value::null())
+                } else {
+                    Value::null()
+                }
+            },
+            "string" => {
+                let s = if let Some(s) = value.as_string() {
+                    s.clone()
+                } else if let Some(n) = value.as_int() {
+                    n.to_string()
+                } else if let Some(f) = value.as_float() {
+                    f.to_string()
+                } else if let Some(b) = value.as_bool() {
+                    b.to_string()
+                } else if let Some(c) = value.as_char() {
+                    c.to_string()
+                } else if value.is_null() {
+                    "null".to_string()
+                } else {
+                    format!("{}", value)
+                };
+                Value::string(s)
+            },
+            "bool" => {
+                if let Some(b) = value.as_bool() {
+                    Value::bool(b)
+                } else if let Some(n) = value.as_int() {
+                    Value::bool(n != 0)
+                } else if let Some(f) = value.as_float() {
+                    Value::bool(f != 0.0)
+                } else if let Some(s) = value.as_string() {
+                    Value::bool(!s.is_empty())
+                } else if value.is_null() {
+                    Value::bool(false)
+                } else {
+                    Value::bool(value.is_truthy())
+                }
+            },
+            _ => {
+                // 对于自定义类型，检查类型名称是否匹配
+                if let Some(s) = value.as_struct() {
+                    if s.borrow().type_name == target_type {
+                        return value;
+                    }
+                }
+                if let Some(c) = value.as_class() {
+                    if c.borrow().class_name == target_type {
+                        return value;
+                    }
+                }
+                if let Some(e) = value.as_enum() {
+                    if e.enum_name == target_type {
+                        return value;
+                    }
+                }
+                Value::null()
+            }
+        }
+    }
+    
+    /// 检查值是否是指定类型
+    fn check_value_type(&self, value: &Value, type_name: &str) -> bool {
+        match type_name {
+            "int" => value.is_int(),
+            "float" | "f64" => value.is_float(),
+            "string" => value.is_string(),
+            "bool" => value.is_bool(),
+            "null" => value.is_null(),
+            "array" => value.is_array(),
+            "map" => value.is_map(),
+            "function" => value.is_function(),
+            _ => {
+                // 检查自定义类型
+                if let Some(s) = value.as_struct() {
+                    s.borrow().type_name == type_name
+                } else if let Some(c) = value.as_class() {
+                    c.borrow().class_name == type_name
+                } else if let Some(e) = value.as_enum() {
+                    e.enum_name == type_name
+                } else {
+                    false
+                }
+            }
+        }
+    }
+    
+    /// 尝试调用运算符重载方法
+    /// 返回 Some(result) 如果找到重载方法，否则返回 None
+    fn try_operator_overload(&mut self, a: &Value, b: &Value, op_name: &str) -> Result<Option<Value>, RuntimeError> {
+        // 只检查 Class 类型的运算符重载
+        if let Some(instance) = a.as_class() {
+            let class_name = instance.borrow().class_name.clone();
+            let method_name = format!("operator_{}", op_name);
+            
+            // 检查是否有对应的运算符重载方法
+            if let Some(func_index) = self.chunk.get_method(&class_name, &method_name) {
+                let func = if let Some(f) = self.chunk.constants[func_index as usize].as_function() {
+                    f.clone()
+                } else {
+                    return Err(self.runtime_error("Operator method is not a function"));
+                };
+                
+                // 保存当前状态
+                let saved_ip = self.ip;
+                
+                // 设置调用帧
+                let base_slot = self.stack.len();
+                self.push(a.clone()); // this
+                self.push(b.clone()); // other
+                
+                self.frames.push(CallFrame {
+                    return_ip: saved_ip as u32,
+                    base_slot: base_slot as u16,
+                    is_method_call: true,
+                });
+                
+                // 跳转到方法体
+                self.ip = func.chunk_index;
+                
+                // 执行方法直到返回
+                loop {
+                    let op = self.read_byte();
+                    let opcode = OpCode::from(op);
+                    
+                    if matches!(opcode, OpCode::Return) {
+                        // 获取返回值
+                        let result = self.pop()?;
+                        
+                        // 恢复调用帧
+                        if let Some(frame) = self.frames.pop() {
+                            self.stack.truncate(frame.base_slot as usize);
+                            self.ip = frame.return_ip as usize;
+                        }
+                        
+                        return Ok(Some(result));
+                    }
+                    
+                    // 执行其他指令（简化处理，只支持简单的运算符重载方法）
+                    self.execute_operator_instruction(opcode)?;
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// 执行单条指令（用于运算符重载）
+    fn execute_operator_instruction(&mut self, opcode: OpCode) -> Result<(), RuntimeError> {
+        match opcode {
+            OpCode::Const => {
+                let index = self.read_u16();
+                let value = self.chunk.constants[index as usize].clone();
+                self.push(value);
+            }
+            OpCode::Pop => {
+                self.pop()?;
+            }
+            OpCode::GetLocal => {
+                let slot = self.read_u16() as usize;
+                let base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                let value = self.stack[base + slot].clone();
+                self.push(value);
+            }
+            OpCode::SetLocal => {
+                let slot = self.read_u16() as usize;
+                let base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                let value = self.stack.last().cloned().unwrap_or(Value::null());
+                self.stack[base + slot] = value;
+            }
+            OpCode::Add => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                self.push(result);
+            }
+            OpCode::Sub => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = (a - b).map_err(|e| self.runtime_error(&e))?;
+                self.push(result);
+            }
+            OpCode::Mul => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = (a * b).map_err(|e| self.runtime_error(&e))?;
+                self.push(result);
+            }
+            OpCode::Div => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let result = (a / b).map_err(|e| self.runtime_error(&e))?;
+                self.push(result);
+            }
+            OpCode::GetField => {
+                let field_index = self.read_u16() as usize;
+                let field_name = if let Some(s) = self.chunk.constants[field_index].as_string() {
+                    s.clone()
+                } else {
+                    return Err(self.runtime_error("Invalid field name"));
+                };
+                let instance = self.pop()?;
+                if let Some(c) = instance.as_class() {
+                    let c = c.borrow();
+                    if let Some(value) = c.fields.get(&field_name) {
+                        self.push(value.clone());
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Field '{}' not found", field_name
+                        )));
+                    }
+                } else {
+                    return Err(self.runtime_error("Cannot access field on non-class"));
+                }
+            }
+            _ => {
+                // 其他指令暂不支持在运算符重载中使用
+                return Err(self.runtime_error("Unsupported instruction in operator overload"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_code(source: &str) -> Result<(), RuntimeError> {
+        use crate::lexer::Scanner;
+        use crate::parser::Parser;
+        use crate::compiler::Compiler;
+
+        let mut scanner = Scanner::new(source);
+        let tokens = scanner.scan_tokens();
+        let mut parser = Parser::new(tokens, Locale::En);
+        let program = parser.parse().unwrap();
+        let mut compiler = Compiler::new(Locale::En);
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new(chunk, Locale::En);
+        vm.run()
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        assert!(run_code("print(1 + 2)").is_ok());
+        assert!(run_code("print(10 - 3)").is_ok());
+        assert!(run_code("print(4 * 5)").is_ok());
+        assert!(run_code("print(20 / 4)").is_ok());
+    }
+
+    #[test]
+    fn test_precedence() {
+        assert!(run_code("print(1 + 2 * 3)").is_ok());
+        assert!(run_code("print((1 + 2) * 3)").is_ok());
+    }
+    
+    #[test]
+    fn test_variables() {
+        // 变量声明和使用
+        assert!(run_code("var x = 10\nprintln(x)").is_ok());
+        // 变量赋值
+        assert!(run_code("var x = 10\nx = 20\nprintln(x)").is_ok());
+        // 多变量
+        assert!(run_code("var a = 1\nvar b = 2\nprintln(a + b)").is_ok());
+    }
+    
+    #[test]
+    fn test_constants() {
+        // 常量声明和使用
+        assert!(run_code("const PI = 3.14\nprintln(PI)").is_ok());
+    }
+    
+    #[test]
+    fn test_if_statement() {
+        // 简单 if
+        assert!(run_code("var x = 10\nif x > 5 { println(x) }").is_ok());
+        // if-else
+        assert!(run_code("var x = 3\nif x > 5 { println(1) } else { println(2) }").is_ok());
+    }
+    
+    #[test]
+    fn test_for_loop() {
+        // 条件循环
+        assert!(run_code("var i = 0\nfor i < 3 { println(i)\ni = i + 1 }").is_ok());
+        // 无限循环 + break
+        assert!(run_code("var i = 0\nfor { if i >= 3 { break }\nprintln(i)\ni = i + 1 }").is_ok());
+    }
+    
+    #[test]
+    fn test_scope() {
+        // 作用域测试
+        assert!(run_code("var x = 1\n{ var x = 2\nprintln(x) }\nprintln(x)").is_ok());
+    }
+    
+    #[test]
+    fn test_comparison() {
+        assert!(run_code("println(1 == 1)").is_ok());
+        assert!(run_code("println(1 != 2)").is_ok());
+        assert!(run_code("println(3 < 5)").is_ok());
+        assert!(run_code("println(5 <= 5)").is_ok());
+        assert!(run_code("println(5 > 3)").is_ok());
+        assert!(run_code("println(5 >= 5)").is_ok());
+    }
+    
+    #[test]
+    fn test_logical_not() {
+        assert!(run_code("println(!true)").is_ok());
+        assert!(run_code("println(!false)").is_ok());
+    }
+    
+    #[test]
+    fn test_closure_basic() {
+        // 简单闭包定义和调用
+        assert!(run_code("var add = fn(a:int, b:int) int { return a + b }\nprintln(add(1, 2))").is_ok());
+    }
+    
+    #[test]
+    fn test_closure_no_params() {
+        // 无参闭包
+        assert!(run_code("var greet = fn() string { return \"Hello\" }\nprintln(greet())").is_ok());
+    }
+    
+    #[test]
+    fn test_closure_implicit_return() {
+        // 隐式返回 null
+        assert!(run_code("var f = fn() { println(42) }\nf()").is_ok());
+    }
+    
+    #[test]
+    fn test_closure_nested_calls() {
+        // 嵌套调用
+        let code = r#"
+var double = fn(x:int) int { return x * 2 }
+var add_one = fn(x:int) int { return x + 1 }
+println(double(add_one(5)))
+"#;
+        assert!(run_code(code).is_ok());
+    }
+    
+    #[test]
+    fn test_logical_short_circuit_and() {
+        // && 短路测试：false && 不会执行右侧
+        assert!(run_code("var x = false && true\nprintln(x)").is_ok());
+        assert!(run_code("var x = true && false\nprintln(x)").is_ok());
+        assert!(run_code("var x = true && true\nprintln(x)").is_ok());
+    }
+    
+    #[test]
+    fn test_logical_short_circuit_or() {
+        // || 短路测试：true || 不会执行右侧
+        assert!(run_code("var x = true || false\nprintln(x)").is_ok());
+        assert!(run_code("var x = false || true\nprintln(x)").is_ok());
+        assert!(run_code("var x = false || false\nprintln(x)").is_ok());
+    }
+}

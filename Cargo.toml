@@ -1,0 +1,12 @@
+[package]
+name = "mylang"
+version = "0.1.0"
+edition = "2021"
+description = "A programming language compiler and virtual machine"
+authors = ["Usopp"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
