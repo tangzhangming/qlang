@@ -137,6 +137,7 @@ pub enum HeapTag {
     WaitGroup = 13,
     Set = 14,
     ArraySlice = 15,
+    RuntimeTypeInfo = 16,
 }
 
 /// 堆对象头部
@@ -341,6 +342,157 @@ pub struct HeapTypeRef {
 }
 
 // ============================================================================
+// 运行时类型信息（反射支持）
+// ============================================================================
+
+/// 类型种类
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeKind {
+    /// 原始类型（int, float, bool, char, string）
+    Primitive,
+    /// 数组类型
+    Array,
+    /// Map 类型
+    Map,
+    /// Set 类型
+    Set,
+    /// 函数类型
+    Function,
+    /// 结构体类型
+    Struct,
+    /// 类类型
+    Class,
+    /// 枚举类型
+    Enum,
+    /// 接口类型
+    Interface,
+    /// Trait 类型
+    Trait,
+    /// 可空类型
+    Nullable,
+    /// 泛型类型
+    Generic,
+    /// 类型别名
+    Alias,
+    /// 未知类型
+    Unknown,
+}
+
+/// 字段信息（反射）
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    /// 字段名称
+    pub name: String,
+    /// 字段类型名称
+    pub type_name: String,
+    /// 是否是公开的
+    pub is_public: bool,
+    /// 是否是静态的
+    pub is_static: bool,
+    /// 是否是常量
+    pub is_const: bool,
+}
+
+/// 方法信息（反射）
+#[derive(Debug, Clone)]
+pub struct MethodInfo {
+    /// 方法名称
+    pub name: String,
+    /// 参数类型列表
+    pub param_types: Vec<String>,
+    /// 返回类型名称
+    pub return_type: String,
+    /// 是否是公开的
+    pub is_public: bool,
+    /// 是否是静态的
+    pub is_static: bool,
+    /// 是否是抽象的
+    pub is_abstract: bool,
+}
+
+/// 运行时类型信息（反射支持）
+#[derive(Debug, Clone)]
+pub struct RuntimeTypeInfoData {
+    /// 类型名称
+    pub name: String,
+    /// 类型种类
+    pub kind: TypeKind,
+    /// 父类型名称（对于 class）
+    pub parent: Option<String>,
+    /// 实现的接口/trait 列表
+    pub implements: Vec<String>,
+    /// 字段列表（对于 struct/class）
+    pub fields: Vec<FieldInfo>,
+    /// 方法列表（对于 struct/class/interface/trait）
+    pub methods: Vec<MethodInfo>,
+    /// 泛型参数名称（如果是泛型类型）
+    pub type_params: Vec<String>,
+    /// 元素类型（对于 Array、Set、Nullable 等）
+    pub element_type: Option<Box<RuntimeTypeInfoData>>,
+    /// 键类型（对于 Map）
+    pub key_type: Option<Box<RuntimeTypeInfoData>>,
+    /// 值类型（对于 Map）
+    pub value_type: Option<Box<RuntimeTypeInfoData>>,
+}
+
+impl RuntimeTypeInfoData {
+    /// 创建简单的原始类型信息
+    pub fn primitive(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            kind: TypeKind::Primitive,
+            parent: None,
+            implements: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            type_params: Vec::new(),
+            element_type: None,
+            key_type: None,
+            value_type: None,
+        }
+    }
+    
+    /// 创建数组类型信息
+    pub fn array(element_type: RuntimeTypeInfoData) -> Self {
+        Self {
+            name: format!("{}[]", element_type.name),
+            kind: TypeKind::Array,
+            parent: None,
+            implements: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            type_params: Vec::new(),
+            element_type: Some(Box::new(element_type)),
+            key_type: None,
+            value_type: None,
+        }
+    }
+    
+    /// 创建未知类型信息
+    pub fn unknown() -> Self {
+        Self {
+            name: "unknown".to_string(),
+            kind: TypeKind::Unknown,
+            parent: None,
+            implements: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            type_params: Vec::new(),
+            element_type: None,
+            key_type: None,
+            value_type: None,
+        }
+    }
+}
+
+/// 堆上的运行时类型信息
+#[repr(C)]
+pub struct HeapRuntimeTypeInfo {
+    pub header: HeapObject,
+    pub data: Box<RuntimeTypeInfoData>,
+}
+
+// ============================================================================
 // 并发对象定义
 // ============================================================================
 
@@ -365,11 +517,96 @@ pub struct HeapMutex {
     pub inner: Arc<Mutex<Value>>,
 }
 
-/// WaitGroup 内部状态
+/// WaitGroup 内部状态（优化版本）
+/// 
+/// 使用无锁快速路径 + 自旋等待 + Condvar 等待的分层策略
 pub struct WaitGroupState {
-    pub counter: Arc<AtomicUsize>,
-    pub mutex: Arc<Mutex<()>>,
-    pub condvar: Arc<parking_lot::Condvar>,
+    /// 计数器（直接内联，减少间接访问）
+    pub counter: AtomicUsize,
+    /// 等待者计数（用于优化通知）
+    pub waiters: AtomicUsize,
+    /// 等待用的互斥锁
+    pub mutex: Mutex<()>,
+    /// 条件变量
+    pub condvar: parking_lot::Condvar,
+}
+
+impl WaitGroupState {
+    /// 创建新的 WaitGroup 状态
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            counter: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
+            mutex: Mutex::new(()),
+            condvar: parking_lot::Condvar::new(),
+        }
+    }
+    
+    /// 增加计数
+    #[inline]
+    pub fn add(&self, delta: isize) {
+        if delta > 0 {
+            self.counter.fetch_add(delta as usize, Ordering::SeqCst);
+        } else if delta < 0 {
+            let abs_delta = (-delta) as usize;
+            let old = self.counter.fetch_sub(abs_delta, Ordering::SeqCst);
+            // 如果计数器归零且有等待者，通知它们
+            if old == abs_delta && self.waiters.load(Ordering::Acquire) > 0 {
+                self.condvar.notify_all();
+            }
+        }
+    }
+    
+    /// 完成一个任务（减少计数）
+    #[inline]
+    pub fn done(&self) {
+        let old = self.counter.fetch_sub(1, Ordering::SeqCst);
+        // 如果计数器归零且有等待者，通知它们
+        if old == 1 && self.waiters.load(Ordering::Acquire) > 0 {
+            self.condvar.notify_all();
+        }
+    }
+    
+    /// 等待计数器归零
+    #[inline]
+    pub fn wait(&self) {
+        // 快速路径：无锁检查
+        if self.counter.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        
+        // 自旋等待：短暂自旋减少上下文切换
+        const SPIN_LIMIT: usize = 40;
+        for _ in 0..SPIN_LIMIT {
+            if self.counter.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        
+        // 慢速路径：注册为等待者并使用 Condvar
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        
+        let mut guard = self.mutex.lock();
+        while self.counter.load(Ordering::Acquire) > 0 {
+            self.condvar.wait(&mut guard);
+        }
+        
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+    
+    /// 获取当前计数
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.counter.load(Ordering::Acquire)
+    }
+}
+
+impl Default for WaitGroupState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 堆上的 WaitGroup
@@ -631,6 +868,18 @@ impl Value {
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
+    /// 创建运行时类型信息值
+    #[inline]
+    pub fn runtime_type_info(data: RuntimeTypeInfoData) -> Self {
+        let boxed = Box::new(HeapRuntimeTypeInfo {
+            header: HeapObject { tag: HeapTag::RuntimeTypeInfo },
+            data: Box::new(data),
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::RuntimeTypeInfo, std::mem::size_of::<HeapRuntimeTypeInfo>());
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
     /// 创建 Channel 值
     #[inline]
     pub fn channel(state: Arc<Mutex<ChannelState>>) -> Self {
@@ -815,6 +1064,12 @@ impl Value {
     #[inline]
     pub fn is_type_ref(&self) -> bool {
         self.heap_tag() == Some(HeapTag::TypeRef)
+    }
+    
+    /// 是否是运行时类型信息
+    #[inline]
+    pub fn is_runtime_type_info(&self) -> bool {
+        self.heap_tag() == Some(HeapTag::RuntimeTypeInfo)
     }
     
     /// 是否是 Channel
@@ -1152,6 +1407,17 @@ impl Value {
         }
     }
     
+    /// 获取运行时类型信息引用
+    #[inline]
+    pub fn as_runtime_type_info(&self) -> Option<&RuntimeTypeInfoData> {
+        if self.heap_tag() == Some(HeapTag::RuntimeTypeInfo) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapRuntimeTypeInfo;
+            unsafe { Some(&(*ptr).data) }
+        } else {
+            None
+        }
+    }
+    
     /// 获取 Channel 引用
     #[inline]
     pub fn as_channel(&self) -> Option<&Arc<Mutex<ChannelState>>> {
@@ -1242,6 +1508,7 @@ impl Value {
             Some(HeapTag::Channel) => "channel",
             Some(HeapTag::MutexValue) => "mutex",
             Some(HeapTag::WaitGroup) => "waitgroup",
+            Some(HeapTag::RuntimeTypeInfo) => "Type",
             None => "unknown",
         }
     }
@@ -1727,6 +1994,41 @@ impl fmt::Display for Value {
             }
         } else if let Some(name) = self.as_type_ref() {
             write!(f, "<type {}>", name)
+        } else if let Some(ti) = self.as_runtime_type_info() {
+            // 运行时类型信息：显示详细的类型信息
+            write!(f, "Type(name={}, kind={:?}", ti.name, ti.kind)?;
+            if let Some(ref parent) = ti.parent {
+                write!(f, ", parent={}", parent)?;
+            }
+            if !ti.implements.is_empty() {
+                write!(f, ", implements=[{}]", ti.implements.join(", "))?;
+            }
+            if !ti.fields.is_empty() {
+                write!(f, ", fields=[")?;
+                for (i, field) in ti.fields.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}: {}", field.name, field.type_name)?;
+                }
+                write!(f, "]")?;
+            }
+            if !ti.methods.is_empty() {
+                write!(f, ", methods=[")?;
+                for (i, method) in ti.methods.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}()", method.name)?;
+                }
+                write!(f, "]")?;
+            }
+            if let Some(ref elem) = ti.element_type {
+                write!(f, ", element_type={}", elem.name)?;
+            }
+            if let Some(ref key) = ti.key_type {
+                write!(f, ", key_type={}", key.name)?;
+            }
+            if let Some(ref val) = ti.value_type {
+                write!(f, ", value_type={}", val.name)?;
+            }
+            write!(f, ")")
         } else if self.is_channel() {
             write!(f, "<channel>")
         } else if self.is_mutex() {

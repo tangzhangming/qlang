@@ -5,6 +5,7 @@
 use crate::compiler::{Chunk, OpCode};
 use crate::i18n::{Locale, format_message, messages};
 use super::value::{Value, Iterator, IteratorSource, StructInstance, Function};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use parking_lot::Mutex;
@@ -914,6 +915,130 @@ impl VM {
                     let value = self.pop()?;
                     let type_name = value.type_name();
                     self.push(Value::string(type_name.to_string()));
+                }
+                
+                OpCode::TypeInfo => {
+                    use super::value::{RuntimeTypeInfoData, TypeKind, FieldInfo, MethodInfo};
+                    
+                    let value = self.pop()?;
+                    
+                    // 根据值的类型创建对应的类型信息
+                    let type_info = if value.is_null() {
+                        RuntimeTypeInfoData::primitive("null")
+                    } else if value.is_bool() {
+                        RuntimeTypeInfoData::primitive("bool")
+                    } else if value.is_int() {
+                        RuntimeTypeInfoData::primitive("int")
+                    } else if value.is_float() {
+                        RuntimeTypeInfoData::primitive("float")
+                    } else if value.is_char() {
+                        RuntimeTypeInfoData::primitive("char")
+                    } else if value.as_string().is_some() {
+                        RuntimeTypeInfoData::primitive("string")
+                    } else if value.is_function() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "function".to_string();
+                        info.kind = TypeKind::Function;
+                        
+                        // 如果能获取函数信息，添加更多细节
+                        if let Some(func) = value.as_function() {
+                            if let Some(name) = &func.name {
+                                info.name = name.clone();
+                            }
+                            // 记录参数数量作为一个"方法"
+                            info.methods.push(MethodInfo {
+                                name: "(call)".to_string(),
+                                param_types: vec!["any".to_string(); func.arity],
+                                return_type: "any".to_string(),
+                                is_public: true,
+                                is_static: false,
+                                is_abstract: false,
+                            });
+                        }
+                        info
+                    } else if value.as_array().is_some() {
+                        let element_info = RuntimeTypeInfoData::primitive("any");
+                        RuntimeTypeInfoData::array(element_info)
+                    } else if value.as_map().is_some() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "map".to_string();
+                        info.kind = TypeKind::Map;
+                        info.key_type = Some(Box::new(RuntimeTypeInfoData::primitive("any")));
+                        info.value_type = Some(Box::new(RuntimeTypeInfoData::primitive("any")));
+                        info
+                    } else if value.as_set().is_some() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "set".to_string();
+                        info.kind = TypeKind::Set;
+                        info.element_type = Some(Box::new(RuntimeTypeInfoData::primitive("any")));
+                        info
+                    } else if let Some(s) = value.as_struct() {
+                        let s = s.lock();
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = s.type_name.clone();
+                        info.kind = TypeKind::Struct;
+                        info.fields = s.fields.keys().map(|k| FieldInfo {
+                            name: k.clone(),
+                            type_name: "any".to_string(),
+                            is_public: true,
+                            is_static: false,
+                            is_const: false,
+                        }).collect();
+                        info
+                    } else if let Some(c) = value.as_class() {
+                        let c = c.lock();
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = c.class_name.clone();
+                        info.kind = TypeKind::Class;
+                        info.parent = c.parent_class.clone();
+                        info.fields = c.fields.keys().map(|k| FieldInfo {
+                            name: k.clone(),
+                            type_name: "any".to_string(),
+                            is_public: true,
+                            is_static: false,
+                            is_const: false,
+                        }).collect();
+                        info
+                    } else if let Some(e) = value.as_enum() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = format!("{}::{}", e.enum_name, e.variant_name);
+                        info.kind = TypeKind::Enum;
+                        info.fields = e.associated_data.keys().map(|k| FieldInfo {
+                            name: k.clone(),
+                            type_name: "any".to_string(),
+                            is_public: true,
+                            is_static: false,
+                            is_const: false,
+                        }).collect();
+                        info
+                    } else if value.is_channel() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "channel".to_string();
+                        info.kind = TypeKind::Primitive; // 通道作为原始类型处理
+                        info
+                    } else if value.is_mutex() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "mutex".to_string();
+                        info.kind = TypeKind::Primitive;
+                        info
+                    } else if value.is_waitgroup() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = "waitgroup".to_string();
+                        info.kind = TypeKind::Primitive;
+                        info
+                    } else if let Some(t) = value.as_type_ref() {
+                        let mut info = RuntimeTypeInfoData::unknown();
+                        info.name = t.clone();
+                        info.kind = TypeKind::Alias;
+                        info
+                    } else if let Some(ti) = value.as_runtime_type_info() {
+                        // 如果已经是类型信息，直接克隆返回
+                        ti.clone()
+                    } else {
+                        RuntimeTypeInfoData::unknown()
+                    };
+                    
+                    self.push(Value::runtime_type_info(type_info));
                 }
                 
                 OpCode::SizeOf => {
@@ -3862,27 +3987,19 @@ impl VM {
                 OpCode::WaitGroupNew => {
                     use super::value::WaitGroupState;
                     
-                    let state = Arc::new(WaitGroupState {
-                        counter: Arc::new(AtomicUsize::new(0)),
-                        mutex: Arc::new(Mutex::new(())),
-                        condvar: Arc::new(parking_lot::Condvar::new()),
-                    });
+                    // 使用优化的 WaitGroupState
+                    let state = Arc::new(WaitGroupState::new());
                     self.push_fast(Value::waitgroup(state));
                 }
                 
                 OpCode::WaitGroupAdd => {
-                    use std::sync::atomic::Ordering;
-                    
                     let delta = self.pop()?;
                     let wg = self.pop()?;
                     
                     if let Some(state) = wg.as_waitgroup() {
                         if let Some(n) = delta.as_int() {
-                            if n > 0 {
-                                state.counter.fetch_add(n as usize, Ordering::SeqCst);
-                            } else if n < 0 {
-                                state.counter.fetch_sub((-n) as usize, Ordering::SeqCst);
-                            }
+                            // 使用优化的 add 方法
+                            state.add(n as isize);
                         } else {
                             return Err(self.runtime_error("WaitGroup add requires int"));
                         }
@@ -3894,16 +4011,11 @@ impl VM {
                 }
                 
                 OpCode::WaitGroupDone => {
-                    use std::sync::atomic::Ordering;
-                    
                     let wg = self.pop()?;
                     
                     if let Some(state) = wg.as_waitgroup() {
-                        let old = state.counter.fetch_sub(1, Ordering::SeqCst);
-                        if old == 1 {
-                            // 计数器归零，通知所有等待者
-                            state.condvar.notify_all();
-                        }
+                        // 使用优化的 done 方法
+                        state.done();
                     } else {
                         return Err(self.runtime_error(&format!("Cannot done on {}", wg.type_name())));
                     }
@@ -3912,16 +4024,11 @@ impl VM {
                 }
                 
                 OpCode::WaitGroupWait => {
-                    use std::sync::atomic::Ordering;
-                    
                     let wg = self.pop()?;
                     
                     if let Some(state) = wg.as_waitgroup() {
-                        // 阻塞等待计数器归零
-                        let mut guard = state.mutex.lock();
-                        while state.counter.load(Ordering::SeqCst) != 0 {
-                            state.condvar.wait(&mut guard);
-                        }
+                        // 使用优化的 wait 方法（包含快速路径 + 自旋 + 阻塞）
+                        state.wait();
                     } else {
                         return Err(self.runtime_error(&format!("Cannot wait on {}", wg.type_name())));
                     }
@@ -4463,6 +4570,139 @@ impl VM {
                         self.push_fast(return_value);
                         self.ip = frame.return_ip as usize;
                         self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                    }
+                }
+                
+                // ============ 枚举操作 ============
+                OpCode::NewEnumSimple => {
+                    use super::value::EnumVariantValue;
+                    
+                    let enum_name_idx = self.read_u16();
+                    let variant_name_idx = self.read_u16();
+                    
+                    let enum_name = self.chunk.get_string(enum_name_idx).to_string();
+                    let variant_name = self.chunk.get_string(variant_name_idx).to_string();
+                    
+                    let variant = EnumVariantValue {
+                        enum_name,
+                        variant_name,
+                        value: None,
+                        associated_data: HashMap::new(),
+                    };
+                    self.push(Value::enum_val(Box::new(variant)));
+                }
+                
+                OpCode::NewEnumValue => {
+                    use super::value::EnumVariantValue;
+                    
+                    let enum_name_idx = self.read_u16();
+                    let variant_name_idx = self.read_u16();
+                    let associated_value = self.pop()?;
+                    
+                    let enum_name = self.chunk.get_string(enum_name_idx).to_string();
+                    let variant_name = self.chunk.get_string(variant_name_idx).to_string();
+                    
+                    let variant = EnumVariantValue {
+                        enum_name,
+                        variant_name,
+                        value: Some(associated_value),
+                        associated_data: HashMap::new(),
+                    };
+                    self.push(Value::enum_val(Box::new(variant)));
+                }
+                
+                OpCode::NewEnumFields => {
+                    use super::value::EnumVariantValue;
+                    
+                    let enum_name_idx = self.read_u16();
+                    let variant_name_idx = self.read_u16();
+                    let field_count = self.read_byte() as usize;
+                    
+                    let enum_name = self.chunk.get_string(enum_name_idx).to_string();
+                    let variant_name = self.chunk.get_string(variant_name_idx).to_string();
+                    
+                    // 收集字段（从栈上弹出 field_name, value 对）
+                    let mut associated_data = HashMap::with_capacity(field_count);
+                    for _ in 0..field_count {
+                        let value = self.pop()?;
+                        let field_name = self.pop()?;
+                        if let Some(name) = field_name.as_string() {
+                            associated_data.insert(name.clone(), value);
+                        }
+                    }
+                    
+                    let variant = EnumVariantValue {
+                        enum_name,
+                        variant_name,
+                        value: None,
+                        associated_data,
+                    };
+                    self.push(Value::enum_val(Box::new(variant)));
+                }
+                
+                OpCode::EnumVariantName => {
+                    let enum_val = self.pop()?;
+                    if let Some(variant) = enum_val.as_enum() {
+                        self.push(Value::string(variant.variant_name.clone()));
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Expected enum value, found {}",
+                            enum_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::EnumGetValue => {
+                    let enum_val = self.pop()?;
+                    if let Some(variant) = enum_val.as_enum() {
+                        if let Some(value) = &variant.value {
+                            self.push(*value);
+                        } else {
+                            self.push(Value::null());
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Expected enum value, found {}",
+                            enum_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::EnumGetField => {
+                    let field_name_idx = self.read_u16();
+                    let enum_val = self.pop()?;
+                    
+                    let field_name = self.chunk.get_string(field_name_idx);
+                    
+                    if let Some(variant) = enum_val.as_enum() {
+                        if let Some(value) = variant.associated_data.get(field_name) {
+                            self.push(*value);
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Enum variant '{}::{}' has no field '{}'",
+                                variant.enum_name, variant.variant_name, field_name
+                            )));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Expected enum value, found {}",
+                            enum_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::EnumMatch => {
+                    let variant_name_idx = self.read_u16();
+                    let enum_val = self.pop()?;
+                    
+                    let variant_name = self.chunk.get_string(variant_name_idx);
+                    
+                    if let Some(variant) = enum_val.as_enum() {
+                        let is_match = variant.variant_name == variant_name;
+                        self.push(Value::bool(is_match));
+                    } else {
+                        // 非枚举类型总是不匹配
+                        self.push(Value::bool(false));
                     }
                 }
             }

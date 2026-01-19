@@ -565,6 +565,9 @@ impl MarkSweepGc {
                 HeapTag::WaitGroup => {
                     let _ = Box::from_raw(obj.ptr as *mut super::value::HeapWaitGroup);
                 }
+                HeapTag::RuntimeTypeInfo => {
+                    let _ = Box::from_raw(obj.ptr as *mut super::value::HeapRuntimeTypeInfo);
+                }
             }
         }
     }

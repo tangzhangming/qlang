@@ -1773,35 +1773,56 @@ impl Compiler {
                 self.compile_expr(expr);
             }
             Expr::Call { callee, args, span } => {
-                // 检查是否是内置函数
+                // 提取参数值（命名参数将在后面处理）
+                let has_named_args = args.iter().any(|(name, _)| name.is_some());
+                
+                // 检查是否是内置函数（内置函数不支持命名参数）
                 if let Expr::Identifier { name, .. } = callee.as_ref() {
+                    if has_named_args {
+                        // 内置函数不支持命名参数，但仍需检查
+                        match name.as_str() {
+                            "print" | "println" | "typeof" | "typeinfo" | "sizeof" | "panic" | "time" => {
+                                let msg = "Built-in functions do not support named arguments".to_string();
+                                self.errors.push(CompileError::new(msg, *span));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    
                     match name.as_str() {
                         "print" if args.len() == 1 => {
-                            self.compile_expr(&args[0]);
+                            self.compile_expr(&args[0].1);
                             self.chunk.write_op(OpCode::Print, span.line);
                             // 内置函数需要返回值，以便作为表达式使用
                             self.chunk.write_constant(Value::null(), span.line);
                             return;
                         }
                         "println" if args.len() == 1 => {
-                            self.compile_expr(&args[0]);
+                            self.compile_expr(&args[0].1);
                             self.chunk.write_op(OpCode::PrintLn, span.line);
                             // 内置函数需要返回值，以便作为表达式使用
                             self.chunk.write_constant(Value::null(), span.line);
                             return;
                         }
                         "typeof" if args.len() == 1 => {
-                            self.compile_expr(&args[0]);
+                            self.compile_expr(&args[0].1);
                             self.chunk.write_op(OpCode::TypeOf, span.line);
                             return;
                         }
+                        "typeinfo" if args.len() == 1 => {
+                            // 获取完整的运行时类型信息对象
+                            self.compile_expr(&args[0].1);
+                            self.chunk.write_op(OpCode::TypeInfo, span.line);
+                            return;
+                        }
                         "sizeof" if args.len() == 1 => {
-                            self.compile_expr(&args[0]);
+                            self.compile_expr(&args[0].1);
                             self.chunk.write_op(OpCode::SizeOf, span.line);
                             return;
                         }
                         "panic" if args.len() == 1 => {
-                            self.compile_expr(&args[0]);
+                            self.compile_expr(&args[0].1);
                             self.chunk.write_op(OpCode::Panic, span.line);
                             return;
                         }
@@ -1829,7 +1850,7 @@ impl Compiler {
                         let method_name_index = self.chunk.add_constant(Value::string(member.clone()));
                         
                         // 先编译所有参数
-                        for arg in args {
+                        for (_, arg) in args {
                             self.compile_expr(arg);
                         }
                         
@@ -1860,7 +1881,7 @@ impl Compiler {
                         self.chunk.write_u16(func_index, span.line);
                         
                         // 2. 然后编译所有参数
-                        for arg in args {
+                        for (_, arg) in args {
                             self.compile_expr(arg);
                         }
                         
@@ -1889,7 +1910,7 @@ impl Compiler {
                         }
                         
                         // 编译所有参数
-                        for arg in args {
+                        for (_, arg) in args {
                             self.compile_expr(arg);
                         }
                         
@@ -1930,7 +1951,7 @@ impl Compiler {
                                 self.chunk.write_u16(func_index, span.line);
                                 
                                 // 2. 然后编译所有参数
-                                for arg in args {
+                                for (_, arg) in args {
                                     self.compile_expr(arg);
                                 }
                                 
@@ -1951,7 +1972,7 @@ impl Compiler {
                     self.compile_expr(object);
                     
                     // 编译所有参数
-                    for arg in args {
+                    for (_, arg) in args {
                         self.compile_expr(arg);
                     }
                     
@@ -1978,7 +1999,7 @@ impl Compiler {
                     self.compile_expr(object);
                     
                     // 编译所有参数
-                    for arg in args {
+                    for (_, arg) in args {
                         self.compile_expr(arg);
                     }
                     
@@ -2005,7 +2026,7 @@ impl Compiler {
                     self.compile_expr(object);
                     
                     // 编译所有参数
-                    for arg in args {
+                    for (_, arg) in args {
                         self.compile_expr(arg);
                     }
                     
@@ -2031,8 +2052,19 @@ impl Compiler {
                 self.compile_expr(callee);
                 
                 // 2. 编译所有参数（依次压栈）
-                for arg in args {
-                    self.compile_expr(arg);
+                // 如果有命名参数，需要重新排列
+                if has_named_args {
+                    // 命名参数调用：需要根据函数定义重排参数
+                    // 这里简单处理：编译时按顺序压栈，运行时重排
+                    // TODO: 完整实现需要在编译时查找函数定义并重排
+                    for (_, arg) in args {
+                        self.compile_expr(arg);
+                    }
+                } else {
+                    // 位置参数：按顺序压栈
+                    for (_, arg) in args {
+                        self.compile_expr(arg);
+                    }
                 }
                 
                 // 3. 生成 Call 指令
@@ -2557,7 +2589,7 @@ impl Compiler {
                     self.compile_expr(callee);
                     
                     // 编译参数
-                    for arg in args {
+                    for (_, arg) in args {
                         self.compile_expr(arg);
                     }
                     
@@ -2586,17 +2618,17 @@ impl Compiler {
                     Expr::Identifier { name, .. } => {
                         // 排除内置函数
                         match name.as_str() {
-                            "print" | "println" | "typeof" | "sizeof" | "panic" | "time" => None,
+                            "print" | "println" | "typeof" | "typeinfo" | "sizeof" | "panic" | "time" => None,
                             _ => Some(TailCallInfo {
                                 callee: callee.as_ref().clone(),
-                                args: args.clone(),
+                                args: args.iter().map(|(_, e)| e.clone()).collect(),
                             })
                         }
                     }
                     // 对于更复杂的 callee（如闭包表达式），也可以进行尾调用优化
                     Expr::Closure { .. } => Some(TailCallInfo {
                         callee: callee.as_ref().clone(),
-                        args: args.clone(),
+                        args: args.iter().map(|(_, e)| e.clone()).collect(),
                     }),
                     _ => None, // 其他情况（方法调用、静态成员调用等）暂不优化
                 }

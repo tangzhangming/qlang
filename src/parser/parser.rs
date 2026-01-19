@@ -24,16 +24,124 @@ enum Precedence {
     Primary,
 }
 
+/// 解析错误类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// 意外的 token
+    UnexpectedToken,
+    /// 期望的 token 未找到
+    ExpectedToken,
+    /// 意外的文件结束
+    UnexpectedEof,
+    /// 无效的语法
+    InvalidSyntax,
+    /// 无效的表达式
+    InvalidExpression,
+    /// 重复定义
+    DuplicateDefinition,
+    /// 无效的赋值目标
+    InvalidAssignmentTarget,
+    /// 无效的类型
+    InvalidType,
+}
+
 /// 解析错误
 #[derive(Debug, Clone)]
 pub struct ParseError {
+    /// 错误消息
     pub message: String,
+    /// 错误位置
     pub span: Span,
+    /// 错误类型
+    pub kind: ParseErrorKind,
+    /// 期望的内容（如果有）
+    pub expected: Option<String>,
+    /// 实际得到的内容
+    pub found: Option<String>,
+    /// 修复建议
+    pub hint: Option<String>,
 }
 
 impl ParseError {
+    /// 创建基本错误
     fn new(message: String, span: Span) -> Self {
-        Self { message, span }
+        Self { 
+            message, 
+            span,
+            kind: ParseErrorKind::InvalidSyntax,
+            expected: None,
+            found: None,
+            hint: None,
+        }
+    }
+    
+    /// 创建带类型的错误
+    fn with_kind(message: String, span: Span, kind: ParseErrorKind) -> Self {
+        Self {
+            message,
+            span,
+            kind,
+            expected: None,
+            found: None,
+            hint: None,
+        }
+    }
+    
+    /// 创建期望 token 错误
+    fn expected_token(expected: &str, found: &str, span: Span) -> Self {
+        Self {
+            message: format!("Expected '{}', but found '{}'", expected, found),
+            span,
+            kind: ParseErrorKind::ExpectedToken,
+            expected: Some(expected.to_string()),
+            found: Some(found.to_string()),
+            hint: None,
+        }
+    }
+    
+    /// 创建意外 token 错误
+    fn unexpected_token(found: &str, context: &str, span: Span) -> Self {
+        Self {
+            message: format!("Unexpected '{}' {}", found, context),
+            span,
+            kind: ParseErrorKind::UnexpectedToken,
+            expected: None,
+            found: Some(found.to_string()),
+            hint: None,
+        }
+    }
+    
+    /// 创建意外 EOF 错误
+    fn unexpected_eof(context: &str, span: Span) -> Self {
+        Self {
+            message: format!("Unexpected end of file {}", context),
+            span,
+            kind: ParseErrorKind::UnexpectedEof,
+            expected: None,
+            found: Some("EOF".to_string()),
+            hint: None,
+        }
+    }
+    
+    /// 添加修复建议
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    
+    /// 格式化完整错误消息
+    pub fn format(&self) -> String {
+        let mut msg = self.message.clone();
+        if let Some(hint) = &self.hint {
+            msg.push_str(&format!("\n  Hint: {}", hint));
+        }
+        msg
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format())
     }
 }
 
@@ -47,6 +155,8 @@ pub struct Parser {
     errors: Vec<ParseError>,
     /// 当前语言
     locale: Locale,
+    /// 恐慌模式（遇到错误后进入，用于错误恢复）
+    panic_mode: bool,
 }
 
 impl Parser {
@@ -57,6 +167,7 @@ impl Parser {
             current: 0,
             errors: Vec::new(),
             locale,
+            panic_mode: false,
         }
     }
 
@@ -2351,12 +2462,12 @@ impl Parser {
                 // 检查是否是方法调用
                 if self.check(&TokenKind::LeftParen) {
                     self.advance();
-                    let mut args = Vec::new();
+                    let mut args: Vec<(Option<String>, Expr)> = Vec::new();
                     if !self.check(&TokenKind::RightParen) {
-                        args.push(self.parse_expression()?);
+                        args.push((None, self.parse_expression()?));
                         while self.check(&TokenKind::Comma) {
                             self.advance();
-                            args.push(self.parse_expression()?);
+                            args.push((None, self.parse_expression()?));
                         }
                     }
                     self.expect(&TokenKind::RightParen)?;
@@ -2390,12 +2501,12 @@ impl Parser {
                 // 检查是否是方法调用
                 if self.check(&TokenKind::LeftParen) {
                     self.advance();
-                    let mut args = Vec::new();
+                    let mut args: Vec<(Option<String>, Expr)> = Vec::new();
                     if !self.check(&TokenKind::RightParen) {
-                        args.push(self.parse_expression()?);
+                        args.push((None, self.parse_expression()?));
                         while self.check(&TokenKind::Comma) {
                             self.advance();
-                            args.push(self.parse_expression()?);
+                            args.push((None, self.parse_expression()?));
                         }
                     }
                     self.expect(&TokenKind::RightParen)?;
@@ -2429,12 +2540,12 @@ impl Parser {
                 // 检查是否是方法调用
                 if self.check(&TokenKind::LeftParen) {
                     self.advance();
-                    let mut args = Vec::new();
+                    let mut args: Vec<(Option<String>, Expr)> = Vec::new();
                     if !self.check(&TokenKind::RightParen) {
-                        args.push(self.parse_expression()?);
+                        args.push((None, self.parse_expression()?));
                         while self.check(&TokenKind::Comma) {
                             self.advance();
-                            args.push(self.parse_expression()?);
+                            args.push((None, self.parse_expression()?));
                         }
                     }
                     self.expect(&TokenKind::RightParen)?;
@@ -2472,14 +2583,50 @@ impl Parser {
                 });
             }
             
-            // 函数调用 func(args)
+            // 函数调用 func(args) - 支持命名参数
             TokenKind::LeftParen => {
-                let mut args = Vec::new();
+                let mut args: Vec<(Option<String>, Expr)> = Vec::new();
+                let mut seen_named = false;
+                
                 if !self.check(&TokenKind::RightParen) {
-                    args.push(self.parse_expression()?);
-                    while self.check(&TokenKind::Comma) {
+                    loop {
+                        // 检查是否是命名参数
+                        let (param_name, value) = if let TokenKind::Identifier(name) = &self.current_token().kind {
+                            let name = name.clone();
+                            let save_pos = self.current;
+                            self.advance();
+                            
+                            if self.check(&TokenKind::Colon) {
+                                self.advance();
+                                seen_named = true;
+                                let value = self.parse_expression()?;
+                                (Some(name), value)
+                            } else {
+                                self.current = save_pos;
+                                if seen_named {
+                                    return Err(ParseError::new(
+                                        "Positional arguments cannot follow named arguments".to_string(),
+                                        self.current_span(),
+                                    ));
+                                }
+                                (None, self.parse_expression()?)
+                            }
+                        } else {
+                            if seen_named {
+                                return Err(ParseError::new(
+                                    "Positional arguments cannot follow named arguments".to_string(),
+                                    self.current_span(),
+                                ));
+                            }
+                            (None, self.parse_expression()?)
+                        };
+                        
+                        args.push((param_name, value));
+                        
+                        if !self.check(&TokenKind::Comma) {
+                            break;
+                        }
                         self.advance();
-                        args.push(self.parse_expression()?);
                     }
                 }
                 self.expect(&TokenKind::RightParen)?;
@@ -2590,11 +2737,11 @@ impl Parser {
             // 静态方法调用: ClassName::method(args)
             self.advance(); // 消费 '('
             
-            let mut args = Vec::new();
+            let mut args: Vec<(Option<String>, Expr)> = Vec::new();
             
             if !self.check(&TokenKind::RightParen) {
                 loop {
-                    args.push(self.parse_expression()?);
+                    args.push((None, self.parse_expression()?));
                     
                     if !self.check(&TokenKind::Comma) {
                         break;
@@ -2629,7 +2776,12 @@ impl Parser {
         }
     }
 
-    /// 解析函数调用
+    /// 解析函数调用（支持命名参数）
+    /// 
+    /// 语法: 
+    ///   foo(1, 2, 3)                    - 位置参数
+    ///   foo(name: "Alice", age: 25)    - 命名参数
+    ///   foo(1, name: "Alice")          - 混合（位置参数必须在前）
     fn parse_call(&mut self, callee_name: String, start_span: Span) -> Result<Expr, ParseError> {
         // 创建 callee 表达式
         let callee = Box::new(Expr::Identifier {
@@ -2639,11 +2791,50 @@ impl Parser {
         
         self.advance(); // 消费 '('
         
-        let mut args = Vec::new();
+        let mut args: Vec<(Option<String>, Expr)> = Vec::new();
+        let mut seen_named = false; // 是否已经遇到命名参数
         
         if !self.check(&TokenKind::RightParen) {
             loop {
-                args.push(self.parse_expression()?);
+                // 检查是否是命名参数: name: value
+                let (param_name, value) = if let TokenKind::Identifier(name) = &self.current_token().kind {
+                    let name = name.clone();
+                    let save_pos = self.current;
+                    self.advance(); // 消费标识符
+                    
+                    if self.check(&TokenKind::Colon) {
+                        // 是命名参数
+                        self.advance(); // 消费 ':'
+                        seen_named = true;
+                        let value = self.parse_expression()?;
+                        (Some(name), value)
+                    } else {
+                        // 不是命名参数，回退
+                        self.current = save_pos;
+                        
+                        if seen_named {
+                            return Err(ParseError::new(
+                                "Positional arguments cannot follow named arguments".to_string(),
+                                self.current_span(),
+                            ));
+                        }
+                        
+                        let value = self.parse_expression()?;
+                        (None, value)
+                    }
+                } else {
+                    if seen_named {
+                        return Err(ParseError::new(
+                            "Positional arguments cannot follow named arguments".to_string(),
+                            self.current_span(),
+                        ));
+                    }
+                    
+                    let value = self.parse_expression()?;
+                    (None, value)
+                };
+                
+                args.push((param_name, value));
                 
                 if !self.check(&TokenKind::Comma) {
                     break;
@@ -3030,24 +3221,95 @@ impl Parser {
     }
 
     /// 错误恢复：同步到下一个语句
+    /// 错误恢复：同步到下一个安全点
+    /// 
+    /// 在遇到解析错误后，跳过 token 直到找到可能的语句开始位置，
+    /// 从而能够继续解析并发现更多错误
     fn synchronize(&mut self) {
+        self.panic_mode = true;
+        
         while !self.is_at_end() {
             // 如果前一个是换行或分号，认为同步完成
             if matches!(
                 self.previous_token().kind,
                 TokenKind::Newline | TokenKind::Semicolon
             ) {
+                self.panic_mode = false;
                 return;
             }
             
-            // 跳过直到找到可能的语句开始
-            if matches!(self.current_token().kind, TokenKind::Newline) {
-                self.advance();
+            // 检查是否到达可能的语句开始
+            match self.current_token().kind {
+                // 声明关键字 - 可以开始新语句
+                TokenKind::Var | TokenKind::Const | TokenKind::Func |
+                TokenKind::Class | TokenKind::Struct | TokenKind::Enum |
+                TokenKind::Interface | TokenKind::Trait | TokenKind::Type |
+                TokenKind::Import | TokenKind::Package |
+                // 控制流关键字
+                TokenKind::If | TokenKind::For |
+                TokenKind::Match | TokenKind::Return | TokenKind::Break |
+                TokenKind::Continue | TokenKind::Throw | TokenKind::Try |
+                // 可见性修饰符
+                TokenKind::Public | TokenKind::Private | TokenKind::Internal |
+                // 块结束
+                TokenKind::RightBrace => {
+                    self.panic_mode = false;
+                    return;
+                }
+                TokenKind::Newline => {
+                    self.advance();
+                    self.panic_mode = false;
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        
+        self.panic_mode = false;
+    }
+    
+    /// 在错误恢复模式下跳过到指定 token
+    fn synchronize_to(&mut self, kinds: &[TokenKind]) {
+        self.panic_mode = true;
+        
+        while !self.is_at_end() {
+            if kinds.contains(&self.current_token().kind) {
+                self.panic_mode = false;
                 return;
             }
-            
             self.advance();
         }
+        
+        self.panic_mode = false;
+    }
+    
+    /// 报告错误但不立即返回，用于收集多个错误
+    fn report_error(&mut self, error: ParseError) {
+        // 在恐慌模式下不报告错误，避免级联错误
+        if !self.panic_mode {
+            self.errors.push(error);
+        }
+    }
+    
+    /// 期望其中一个 token
+    fn expect_one_of(&mut self, kinds: &[TokenKind]) -> Result<Token, ParseError> {
+        for kind in kinds {
+            if self.check(kind) {
+                return Ok(self.advance());
+            }
+        }
+        
+        let expected: Vec<String> = kinds.iter().map(|k| format!("{}", k)).collect();
+        let found = self.current_token().lexeme.clone();
+        let span = self.current_span();
+        
+        Err(ParseError::expected_token(
+            &expected.join(" or "),
+            &found,
+            span,
+        ))
     }
     
     /// 解析 try-catch-finally 语句

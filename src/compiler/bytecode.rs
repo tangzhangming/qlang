@@ -93,12 +93,14 @@ pub enum OpCode {
     Print = 70,
     /// 打印栈顶值（换行）
     PrintLn = 71,
-    /// 获取类型名称: pop value, push type_name
+    /// 获取类型名称: pop value, push type_name (字符串)
     TypeOf = 72,
     /// 获取值大小
     SizeOf = 73,
     /// 触发 panic
     Panic = 74,
+    /// 获取完整类型信息: pop value, push RuntimeTypeInfo 对象
+    TypeInfo = 89,
     /// 将栈顶值转换为字符串: pop value, push string
     ToString = 83,
     /// 获取当前时间戳（毫秒）: push timestamp
@@ -358,6 +360,40 @@ pub enum OpCode {
     /// 栈: [..., select_builder] -> [..., result_type, case_index, value?]
     SelectTryExec = 170,
     
+    // ============ 枚举操作 (175-180) ============
+    /// 创建枚举变体（简单值）
+    /// 操作数: enum_name_idx (u16), variant_name_idx (u16)
+    /// 栈: [...] -> [..., enum_value]
+    NewEnumSimple = 175,
+    
+    /// 创建枚举变体（带关联值）
+    /// 操作数: enum_name_idx (u16), variant_name_idx (u16)
+    /// 栈: [..., associated_value] -> [..., enum_value]
+    NewEnumValue = 176,
+    
+    /// 创建枚举变体（带关联数据字段）
+    /// 操作数: enum_name_idx (u16), variant_name_idx (u16), field_count (u8)
+    /// 栈: [..., field_name_1, value_1, ..., field_name_n, value_n] -> [..., enum_value]
+    NewEnumFields = 177,
+    
+    /// 获取枚举变体名称
+    /// 栈: [..., enum_value] -> [..., variant_name:string]
+    EnumVariantName = 178,
+    
+    /// 获取枚举关联值
+    /// 栈: [..., enum_value] -> [..., associated_value]
+    EnumGetValue = 179,
+    
+    /// 获取枚举关联数据字段
+    /// 操作数: field_name_idx (u16)
+    /// 栈: [..., enum_value] -> [..., field_value]
+    EnumGetField = 180,
+    
+    /// 枚举匹配（检查是否为指定变体）
+    /// 操作数: variant_name_idx (u16)
+    /// 栈: [..., enum_value] -> [..., is_match:bool]
+    EnumMatch = 181,
+    
     // ============ 控制 ============
     /// 停止执行
     Halt = 255,
@@ -404,6 +440,7 @@ impl From<u8> for OpCode {
             73 => OpCode::SizeOf,
             74 => OpCode::Panic,
             75 => OpCode::NewArray,
+            89 => OpCode::TypeInfo,
             76 => OpCode::GetIndex,
             77 => OpCode::SetIndex,
             78 => OpCode::NewRange,
@@ -486,6 +523,13 @@ impl From<u8> for OpCode {
             168 => OpCode::SelectAddDefault,
             169 => OpCode::SelectExec,
             170 => OpCode::SelectTryExec,
+            175 => OpCode::NewEnumSimple,
+            176 => OpCode::NewEnumValue,
+            177 => OpCode::NewEnumFields,
+            178 => OpCode::EnumVariantName,
+            179 => OpCode::EnumGetValue,
+            180 => OpCode::EnumGetField,
+            181 => OpCode::EnumMatch,
             255 => OpCode::Halt,
             _ => panic!("Unknown opcode: {}", value),
         }
@@ -637,6 +681,22 @@ impl Chunk {
         }
         self.constants.push(value);
         index as u16
+    }
+    
+    /// 获取常量池中的值
+    #[inline]
+    pub fn get_constant(&self, index: u16) -> &Value {
+        &self.constants[index as usize]
+    }
+    
+    /// 从常量池获取字符串（假设该索引处是字符串类型）
+    #[inline]
+    pub fn get_string(&self, index: u16) -> &str {
+        if let Some(s) = self.constants[index as usize].as_string() {
+            s
+        } else {
+            ""
+        }
     }
 
     /// 写入常量加载指令

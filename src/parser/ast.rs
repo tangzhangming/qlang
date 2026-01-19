@@ -221,10 +221,16 @@ pub enum Expr {
         expr: Box<Expr>,
         span: Span,
     },
-    /// 函数调用
+    /// 函数调用参数（支持命名参数）
+    /// 
+    /// 位置参数: (None, expr)
+    /// 命名参数: (Some("name"), expr)
+    /// 
+    /// 注意: 命名参数必须在位置参数之后
     Call {
         callee: Box<Expr>,
-        args: Vec<Expr>,
+        /// 参数列表：(参数名（如果是命名参数）, 参数值)
+        args: Vec<(Option<String>, Expr)>,
         span: Span,
     },
     /// go 表达式：启动协程

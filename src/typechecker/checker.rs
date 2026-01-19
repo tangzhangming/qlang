@@ -38,6 +38,42 @@ impl TypeChecker {
         }
     }
     
+    /// 检查是否是内置函数
+    fn is_builtin_function(name: &str) -> bool {
+        matches!(name, "print" | "println" | "typeof" | "typeinfo" | "sizeof" | "panic" | "time")
+    }
+    
+    /// 获取内置函数的类型
+    fn builtin_function_type(name: &str) -> Type {
+        match name {
+            "print" | "println" => Type::Function {
+                param_types: vec![Type::Dynamic],
+                return_type: Box::new(Type::Void),
+            },
+            "typeof" => Type::Function {
+                param_types: vec![Type::Dynamic],
+                return_type: Box::new(Type::String),
+            },
+            "typeinfo" => Type::Function {
+                param_types: vec![Type::Dynamic],
+                return_type: Box::new(Type::Dynamic), // 返回 RuntimeTypeInfo 对象
+            },
+            "sizeof" => Type::Function {
+                param_types: vec![Type::Dynamic],
+                return_type: Box::new(Type::Int),
+            },
+            "panic" => Type::Function {
+                param_types: vec![Type::String],
+                return_type: Box::new(Type::Never),
+            },
+            "time" => Type::Function {
+                param_types: vec![],
+                return_type: Box::new(Type::Int),
+            },
+            _ => Type::Unknown,
+        }
+    }
+    
     /// 检查整个程序
     pub fn check_program(&mut self, program: &Program) -> Result<(), Vec<TypeError>> {
         // 第一遍：收集所有类型定义
@@ -513,6 +549,9 @@ impl TypeChecker {
                         param_types: func.param_types.clone(),
                         return_type: Box::new(func.return_type.clone()),
                     })
+                } else if Self::is_builtin_function(name) {
+                    // 内置函数返回特殊的函数类型
+                    Ok(Self::builtin_function_type(name))
                 } else {
                     Err(TypeError::undefined_variable(name.clone(), *span))
                 }
@@ -533,7 +572,9 @@ impl TypeChecker {
             
             Expr::Call { callee, args, span } => {
                 let callee_ty = self.infer_expr(callee)?;
-                self.infer_call(&callee_ty, args, *span)
+                // 提取参数表达式（命名参数的名称在类型检查时忽略）
+                let arg_exprs: Vec<&Expr> = args.iter().map(|(_, e)| e).collect();
+                self.infer_call(&callee_ty, &arg_exprs, *span)
             }
             
             Expr::Index { object, index, span } => {
@@ -930,7 +971,7 @@ impl TypeChecker {
     }
     
     /// 推导函数调用结果类型
-    fn infer_call(&mut self, callee: &Type, args: &[Expr], span: Span) -> Result<Type, TypeError> {
+    fn infer_call(&mut self, callee: &Type, args: &[&Expr], span: Span) -> Result<Type, TypeError> {
         match callee {
             Type::Function { param_types, return_type } => {
                 if args.len() != param_types.len() {
@@ -950,7 +991,7 @@ impl TypeChecker {
                 
                 Ok(return_type.as_ref().clone())
             }
-            Type::Generic { base_type, type_args } => {
+            Type::Generic { base_type, type_args: _ } => {
                 // 泛型函数调用
                 // TODO: 实现泛型参数推导
                 match base_type.as_ref() {
