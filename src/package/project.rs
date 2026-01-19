@@ -150,6 +150,55 @@ pub fn find_project_root(start_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// 计算期望的包名
+/// 
+/// 根据 project.toml 中的 package 和文件的相对路径计算期望包名
+/// 
+/// # 参数
+/// - `project`: 项目配置
+/// - `file_path`: 源文件的绝对路径
+/// 
+/// # 返回
+/// 期望的包名，例如 "com.example.demo.subpackage"
+/// 
+/// # 示例
+/// - project.package = "com.example.demo"
+/// - file_path = "{project_root}/src/xxx/main.q"
+/// - 返回 "com.example.demo.xxx"
+pub fn compute_expected_package(project: &ProjectConfig, file_path: &Path) -> Option<String> {
+    // 获取源码目录的绝对路径
+    let src_dir = project.root_dir.join(&project.src_dir);
+    
+    // 获取文件所在目录
+    let file_dir = file_path.parent()?;
+    
+    // 计算文件相对于源码目录的相对路径
+    let relative_path = file_dir.strip_prefix(&src_dir).ok()?;
+    
+    // 如果相对路径为空，则期望包名就是项目包名
+    if relative_path.as_os_str().is_empty() {
+        return Some(project.package.clone());
+    }
+    
+    // 将路径分隔符转换为包分隔符 (.)
+    let mut package_suffix = String::new();
+    for component in relative_path.components() {
+        if let std::path::Component::Normal(name) = component {
+            if !package_suffix.is_empty() {
+                package_suffix.push('.');
+            }
+            package_suffix.push_str(name.to_str()?);
+        }
+    }
+    
+    // 组合完整包名
+    if package_suffix.is_empty() {
+        Some(project.package.clone())
+    } else {
+        Some(format!("{}.{}", project.package, package_suffix))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +233,25 @@ name = "minimal"
         let config = ProjectConfig::parse(content, Path::new(".")).unwrap();
         assert_eq!(config.name, "minimal");
         assert_eq!(config.package, "minimal"); // 默认使用 name
+    }
+    
+    #[test]
+    fn test_compute_expected_package() {
+        let mut config = ProjectConfig::default();
+        config.package = "com.example.demo".to_string();
+        config.root_dir = PathBuf::from("/project");
+        config.src_dir = "src".to_string();
+        
+        // 根目录下的文件
+        let result = compute_expected_package(&config, Path::new("/project/src/main.q"));
+        assert_eq!(result, Some("com.example.demo".to_string()));
+        
+        // 子目录下的文件
+        let result = compute_expected_package(&config, Path::new("/project/src/xxx/main.q"));
+        assert_eq!(result, Some("com.example.demo.xxx".to_string()));
+        
+        // 嵌套子目录下的文件
+        let result = compute_expected_package(&config, Path::new("/project/src/xxx/yyy/main.q"));
+        assert_eq!(result, Some("com.example.demo.xxx.yyy".to_string()));
     }
 }

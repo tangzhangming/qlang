@@ -16,23 +16,26 @@ mod typechecker;
 
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process;
 
-use config::{LANG_NAME, VERSION, SOURCE_EXTENSION};
+use config::{LANG_NAME, VERSION, SOURCE_EXTENSION, PROJECT_FILE};
 use i18n::{Locale, format_message, messages};
 use lexer::Scanner;
 use parser::Parser;
 use compiler::Compiler;
 use vm::VM;
-use typechecker::{TypeChecker, Monomorphizer};
+use typechecker::{TypeChecker, Monomorphizer, CompileContext};
+use package::{ProjectConfig, find_project_root, compute_expected_package};
 
-/// 运行源代码
+/// 运行源代码（独立文件模式，用于 REPL）
 fn run(source: &str, locale: Locale) -> Result<(), String> {
-    run_with_options(source, locale, true)
+    // REPL 模式下不检查 main 函数和顶级代码限制
+    run_with_context(source, locale, CompileContext::default(), false)
 }
 
-/// 运行源代码（带选项）
-fn run_with_options(source: &str, locale: Locale, type_check: bool) -> Result<(), String> {
+/// 运行源代码（带上下文）
+fn run_with_context(source: &str, locale: Locale, context: CompileContext, type_check: bool) -> Result<(), String> {
     // 词法分析
     let mut scanner = Scanner::new(source);
     let tokens = scanner.scan_tokens();
@@ -61,7 +64,7 @@ fn run_with_options(source: &str, locale: Locale, type_check: bool) -> Result<()
     
     // 类型检查（可选）
     if type_check {
-        let mut type_checker = TypeChecker::new();
+        let mut type_checker = TypeChecker::with_context(context);
         type_checker.check_program(&program).map_err(|errors| {
             errors
                 .iter()
@@ -90,12 +93,40 @@ fn run_with_options(source: &str, locale: Locale, type_check: bool) -> Result<()
             .join("\n")
     })?;
     
-    // 执行
+    // 执行（从 main 函数开始）
     let chunk_arc = std::sync::Arc::new(chunk);
     let mut vm = VM::new(chunk_arc, locale);
     vm.run().map_err(|e| format!("[line {}] {}", e.line, e.message))?;
     
     Ok(())
+}
+
+/// 构建编译上下文
+fn build_compile_context(file_path: &Path) -> CompileContext {
+    // 获取文件的绝对路径
+    let abs_path = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
+    
+    // 尝试查找 project.toml
+    if let Some(project_root) = find_project_root(&abs_path) {
+        let project_file = project_root.join(PROJECT_FILE);
+        if let Ok(project) = ProjectConfig::load(&project_file) {
+            // 计算期望包名
+            let expected_package = compute_expected_package(&project, &abs_path);
+            
+            return CompileContext {
+                is_entry_file: true,
+                expected_package,
+                standalone_mode: false,
+            };
+        }
+    }
+    
+    // 独立文件模式
+    CompileContext {
+        is_entry_file: true,
+        expected_package: None,
+        standalone_mode: true,
+    }
 }
 
 /// 运行文件
@@ -121,7 +152,11 @@ fn run_file(path: &str, locale: Locale) {
         }
     };
     
-    if let Err(e) = run(&source, locale) {
+    // 构建编译上下文
+    let file_path = Path::new(path);
+    let context = build_compile_context(file_path);
+    
+    if let Err(e) = run_with_context(&source, locale, context, true) {
         eprintln!("{}", format_message(messages::MSG_CLI_ERROR, locale, &[&e]));
         process::exit(1);
     }

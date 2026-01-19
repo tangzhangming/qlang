@@ -34,6 +34,12 @@ pub fn get(key: &str) -> &'static str {
         ERR_TYPE_ABSTRACT_INSTANTIATE => "Cannot instantiate abstract class '{}'",
         ERR_TYPE_TRAIT_NOT_IMPL => "Type '{}' does not implement trait '{}'",
         ERR_TYPE_GENERIC_ARGS => "Wrong number of type arguments: expected {}, found {}",
+        ERR_TYPE_TOP_LEVEL_CODE => "Top-level code not allowed: only class, struct, function, enum, interface, trait, and type definitions are permitted",
+        ERR_TYPE_NO_MAIN => "Entry file missing main function: define 'func main()' as the entry point",
+        ERR_TYPE_DUPLICATE_MAIN => "Duplicate main function: only one main function is allowed per package",
+        ERR_TYPE_INVALID_MAIN_SIGNATURE => "Invalid main function signature: should be 'func main()' with no parameters and no return value",
+        ERR_TYPE_PACKAGE_MISMATCH => "Package name mismatch: expected '{}', found '{}'",
+        ERR_TYPE_PACKAGE_NOT_ALLOWED => "Package declaration not allowed in standalone file",
         
         // Runtime errors
         ERR_RUNTIME_DIVISION_BY_ZERO => "Division by zero",

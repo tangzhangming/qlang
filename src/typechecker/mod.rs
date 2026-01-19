@@ -13,5 +13,5 @@ pub use environment::{TypeEnvironment, TypeScope, TypeInfo, FunctionInfo, ClassI
 pub use unify::{Unifier, UnifyResult};
 pub use constraint::{Constraint, ConstraintKind, ConstraintSolver};
 pub use error::{TypeError, TypeErrorKind};
-pub use checker::TypeChecker;
+pub use checker::{TypeChecker, CompileContext};
 pub use monomorphize::{Monomorphizer, MonoKey, MonomorphizedClass, MonomorphizedStruct, MonomorphizedFunction};

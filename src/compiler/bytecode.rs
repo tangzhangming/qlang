@@ -703,6 +703,17 @@ pub struct Chunk {
     pub enums: std::collections::HashMap<String, EnumInfo>,
     /// 命名函数表（函数名 -> 常量池索引）
     pub named_functions: std::collections::HashMap<String, u16>,
+    /// 命名函数信息表（函数名 -> (常量池索引, 参数名列表)）
+    pub named_function_infos: std::collections::HashMap<String, NamedFunctionInfo>,
+}
+
+/// 命名函数信息
+#[derive(Debug, Clone, Default)]
+pub struct NamedFunctionInfo {
+    /// 常量池索引
+    pub func_index: u16,
+    /// 参数名列表
+    pub param_names: Vec<String>,
 }
 
 impl Chunk {
@@ -1082,6 +1093,20 @@ impl Chunk {
     /// 获取命名函数的常量池索引
     pub fn get_named_function(&self, name: &str) -> Option<u16> {
         self.named_functions.get(name).copied()
+    }
+    
+    /// 注册命名函数信息（包含参数名列表）
+    pub fn register_named_function_info(&mut self, name: String, func_index: u16, param_names: Vec<String>) {
+        self.named_functions.insert(name.clone(), func_index);
+        self.named_function_infos.insert(name, NamedFunctionInfo {
+            func_index,
+            param_names,
+        });
+    }
+    
+    /// 获取命名函数信息
+    pub fn get_named_function_info(&self, name: &str) -> Option<&NamedFunctionInfo> {
+        self.named_function_infos.get(name)
     }
 }
 

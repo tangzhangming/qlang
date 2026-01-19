@@ -176,6 +176,18 @@ impl Compiler {
             self.compile_stmt(stmt);
         }
         
+        // 如果有 main 函数，生成调用 main 函数的代码
+        if let Some(main_index) = self.chunk.get_named_function("main") {
+            // 从常量池加载 main 函数
+            self.chunk.write_op(OpCode::Const, 0);
+            self.chunk.write_u16(main_index, 0);
+            // 调用 main 函数（无参数）
+            self.chunk.write_op(OpCode::Call, 0);
+            self.chunk.write(0, 0);
+            // 弹出返回值（main 函数返回 void）
+            self.chunk.write_op(OpCode::Pop, 0);
+        }
+        
         // 添加 HALT 指令
         self.chunk.write_op(OpCode::Halt, 0);
         
@@ -1206,16 +1218,12 @@ impl Compiler {
                 };
                 self.chunk.constants[func_index as usize] = Value::function(Arc::new(func));
                 
-                // 13. 在当前作用域定义函数变量（包含参数名列表，用于命名参数重排）
-                self.chunk.write_op(OpCode::Const, span.line);
-                self.chunk.write_u16(func_index, span.line);
-                
-                // 收集参数名列表
+                // 13. 收集参数名列表并注册到命名函数信息中（用于命名参数重排）
                 let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-                if let Err(msg) = self.symbols.define_function(name.clone(), crate::types::Type::Unknown, param_names) {
-                    self.errors.push(CompileError::new(msg, *span));
-                }
-                // 函数值已经在栈顶，define 会为它分配槽位
+                self.chunk.register_named_function_info(name.clone(), func_index, param_names);
+                
+                // 注意：不再在顶级作用域定义函数变量
+                // 函数调用通过 named_functions 查找，而不是通过符号表
             }
             
             // Package 和 Import 语句在编译阶段不生成字节码

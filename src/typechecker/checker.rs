@@ -12,6 +12,17 @@ use super::constraint::{Constraint, ConstraintSolver};
 use super::unify::Unifier;
 use super::error::{TypeError, TypeErrorKind};
 
+/// 编译上下文
+#[derive(Debug, Clone, Default)]
+pub struct CompileContext {
+    /// 是否是入口文件
+    pub is_entry_file: bool,
+    /// 期望的包名（根据路径计算）
+    pub expected_package: Option<String>,
+    /// 是否是独立文件模式（无 project.toml）
+    pub standalone_mode: bool,
+}
+
 /// 类型检查器
 pub struct TypeChecker {
     /// 类型环境
@@ -24,6 +35,8 @@ pub struct TypeChecker {
     in_function: bool,
     /// 是否在循环内部
     in_loop: bool,
+    /// 编译上下文
+    context: CompileContext,
 }
 
 impl TypeChecker {
@@ -35,7 +48,25 @@ impl TypeChecker {
             errors: Vec::new(),
             in_function: false,
             in_loop: false,
+            context: CompileContext::default(),
         }
+    }
+    
+    /// 创建带上下文的类型检查器
+    pub fn with_context(context: CompileContext) -> Self {
+        Self {
+            env: TypeEnvironment::new(),
+            solver: ConstraintSolver::new(),
+            errors: Vec::new(),
+            in_function: false,
+            in_loop: false,
+            context,
+        }
+    }
+    
+    /// 设置编译上下文
+    pub fn set_context(&mut self, context: CompileContext) {
+        self.context = context;
     }
     
     /// 检查是否是内置函数
@@ -74,26 +105,133 @@ impl TypeChecker {
         }
     }
     
+    /// 检查是否是有效的顶级声明
+    fn is_valid_top_level(stmt: &Stmt) -> bool {
+        matches!(stmt,
+            Stmt::ClassDef { .. } |
+            Stmt::StructDef { .. } |
+            Stmt::InterfaceDef { .. } |
+            Stmt::TraitDef { .. } |
+            Stmt::EnumDef { .. } |
+            Stmt::FnDef { .. } |
+            Stmt::TypeAlias { .. } |
+            Stmt::Package { .. } |
+            Stmt::Import { .. }
+        )
+    }
+    
+    /// 检查 main 函数签名是否正确
+    fn check_main_signature(params: &[FnParam], return_type: &Option<TypeAnnotation>) -> bool {
+        // main 函数应该无参数
+        if !params.is_empty() {
+            return false;
+        }
+        // main 函数应该无返回值或返回 void
+        if let Some(ret) = return_type {
+            if ret.ty != Type::Void {
+                return false;
+            }
+        }
+        true
+    }
+    
+    /// 验证包名
+    fn validate_package(&mut self, program: &Program) {
+        // 如果是独立文件模式，不允许 package 声明
+        if self.context.standalone_mode {
+            if program.package.is_some() {
+                self.errors.push(TypeError::new(
+                    TypeErrorKind::PackageNotAllowedInStandalone,
+                    Span::default(),
+                ));
+            }
+            return;
+        }
+        
+        // 如果有期望包名，检查是否匹配
+        if let Some(expected) = &self.context.expected_package {
+            if let Some(actual) = &program.package {
+                if expected != actual {
+                    self.errors.push(TypeError::new(
+                        TypeErrorKind::PackageMismatch {
+                            expected: expected.clone(),
+                            actual: actual.clone(),
+                        },
+                        Span::default(),
+                    ));
+                }
+            }
+            // 入口文件允许省略 package 声明
+        }
+    }
+    
     /// 检查整个程序
     pub fn check_program(&mut self, program: &Program) -> Result<(), Vec<TypeError>> {
-        // 第一遍：收集所有类型定义
+        // 0. 验证包名
+        self.validate_package(program);
+        
+        // 1. 检查顶级代码限制
+        for stmt in &program.statements {
+            if !Self::is_valid_top_level(stmt) {
+                self.errors.push(TypeError::new(
+                    TypeErrorKind::TopLevelCodeNotAllowed,
+                    stmt.span(),
+                ));
+            }
+        }
+        
+        // 2. 检查 main 函数（入口文件必须有 main 函数）
+        let mut main_count = 0;
+        let mut main_signature_valid = true;
+        
+        for stmt in &program.statements {
+            if let Stmt::FnDef { name, params, return_type, span, .. } = stmt {
+                if name == "main" {
+                    main_count += 1;
+                    if !Self::check_main_signature(params, return_type) {
+                        main_signature_valid = false;
+                        self.errors.push(TypeError::new(
+                            TypeErrorKind::InvalidMainSignature,
+                            *span,
+                        ));
+                    }
+                }
+            }
+        }
+        
+        // 入口文件必须有且只有一个 main 函数
+        if self.context.is_entry_file {
+            if main_count == 0 {
+                self.errors.push(TypeError::new(
+                    TypeErrorKind::MissingMainFunction,
+                    Span::default(),
+                ));
+            } else if main_count > 1 {
+                self.errors.push(TypeError::new(
+                    TypeErrorKind::DuplicateMainFunction,
+                    Span::default(),
+                ));
+            }
+        }
+        
+        // 3. 第一遍：收集所有类型定义
         for stmt in &program.statements {
             self.collect_type_definitions(stmt);
         }
         
-        // 第二遍：检查类型实现
+        // 4. 第二遍：检查类型实现
         for stmt in &program.statements {
             self.check_type_implementations(stmt);
         }
         
-        // 第三遍：检查所有语句
+        // 5. 第三遍：检查所有语句
         for stmt in &program.statements {
             if let Err(e) = self.check_stmt(stmt) {
                 self.errors.push(e);
             }
         }
         
-        // 求解约束
+        // 6. 求解约束
         if let Err(mut errs) = self.solver.solve() {
             self.errors.append(&mut errs);
         }

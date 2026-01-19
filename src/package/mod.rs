@@ -5,5 +5,5 @@
 mod project;
 mod resolver;
 
-pub use project::{ProjectConfig, find_project_root};
+pub use project::{ProjectConfig, find_project_root, compute_expected_package};
 pub use resolver::{PackageResolver, ResolvedImport, ImportKind};

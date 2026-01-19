@@ -34,6 +34,12 @@ pub fn get(key: &str) -> &'static str {
         ERR_TYPE_ABSTRACT_INSTANTIATE => "无法实例化抽象类 '{}'",
         ERR_TYPE_TRAIT_NOT_IMPL => "类型 '{}' 未实现 trait '{}'",
         ERR_TYPE_GENERIC_ARGS => "类型参数数量错误: 期望 {} 个，实际 {} 个",
+        ERR_TYPE_TOP_LEVEL_CODE => "顶级代码不允许：只能定义类、结构体、函数、枚举、接口、Trait 和类型别名",
+        ERR_TYPE_NO_MAIN => "入口文件缺少 main 函数：请定义 'func main()' 作为入口点",
+        ERR_TYPE_DUPLICATE_MAIN => "main 函数重复：同一个包内只允许有一个 main 函数",
+        ERR_TYPE_INVALID_MAIN_SIGNATURE => "main 函数签名错误：应为 'func main()'，无参数无返回值",
+        ERR_TYPE_PACKAGE_MISMATCH => "包名不匹配：期望 '{}'，实际 '{}'",
+        ERR_TYPE_PACKAGE_NOT_ALLOWED => "独立文件不允许 package 声明",
         
         // 运行时错误
         ERR_RUNTIME_DIVISION_BY_ZERO => "除以零错误",

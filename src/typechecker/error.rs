@@ -92,6 +92,21 @@ pub enum TypeErrorKind {
     },
     /// 递归类型无限展开
     InfiniteType,
+    /// 顶级代码不允许
+    TopLevelCodeNotAllowed,
+    /// 入口文件缺少 main 函数
+    MissingMainFunction,
+    /// 同一包内 main 函数重复
+    DuplicateMainFunction,
+    /// main 函数签名错误
+    InvalidMainSignature,
+    /// 包名不匹配
+    PackageMismatch {
+        expected: String,
+        actual: String,
+    },
+    /// 独立文件不允许 package 声明
+    PackageNotAllowedInStandalone,
     /// 其他错误
     Other(String),
 }
@@ -258,6 +273,24 @@ impl fmt::Display for TypeError {
             }
             TypeErrorKind::InfiniteType => {
                 write!(f, "无限类型")
+            }
+            TypeErrorKind::TopLevelCodeNotAllowed => {
+                write!(f, "顶级代码不允许：只能在类/结构体/函数内编写代码")
+            }
+            TypeErrorKind::MissingMainFunction => {
+                write!(f, "入口文件缺少 main 函数")
+            }
+            TypeErrorKind::DuplicateMainFunction => {
+                write!(f, "同一包内不允许多个 main 函数")
+            }
+            TypeErrorKind::InvalidMainSignature => {
+                write!(f, "main 函数签名错误：应为 func main()")
+            }
+            TypeErrorKind::PackageMismatch { expected, actual } => {
+                write!(f, "包名不匹配：期望 {}, 实际 {}", expected, actual)
+            }
+            TypeErrorKind::PackageNotAllowedInStandalone => {
+                write!(f, "独立文件不允许 package 声明")
             }
             TypeErrorKind::Other(msg) => {
                 write!(f, "{}", msg)

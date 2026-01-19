@@ -561,8 +561,14 @@ impl VM {
                 }
                 OP_CALL => {
                     let arg_count = self.read_byte() as usize;
+                    
+                    // 安全检查：确保栈上有足够的元素
+                    if self.stack.len() < arg_count + 1 {
+                        return Err(self.runtime_error("Stack underflow in function call"));
+                    }
+                    
                     let callee_idx = self.stack.len() - arg_count - 1;
-                    let callee = unsafe { self.stack.get_unchecked(callee_idx).clone() };
+                    let callee = self.stack[callee_idx].clone();
                     
                     if let Some(func) = callee.as_function() {
                         // 快速路径：简单函数调用（无默认参数、无可变参数）
@@ -587,9 +593,76 @@ impl VM {
                             self.ip = func.chunk_index;
                             continue;
                         }
+                        // 慢速路径也在这里处理，不要 fall through
+                        // 检查调用深度
+                        if self.frames.len() >= MAX_FRAMES {
+                            return Err(self.runtime_error("Stack overflow: too many nested function calls"));
+                        }
+                        
+                        let fixed_params = if func.has_variadic { func.arity - 1 } else { func.arity };
+                        
+                        // 检查必需参数数量
+                        if arg_count < func.required_params {
+                            let msg = format!(
+                                "Expected at least {} arguments but got {}",
+                                func.required_params, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                        // 如果没有可变参数，检查参数上限
+                        if !func.has_variadic && arg_count > func.arity {
+                            let msg = format!(
+                                "Expected at most {} arguments but got {}",
+                                func.arity, arg_count
+                            );
+                            return Err(self.runtime_error(&msg));
+                        }
+                        
+                        // 处理默认参数：补充缺失的参数
+                        if arg_count < fixed_params && !func.defaults.is_empty() {
+                            let defaults_start = func.required_params;
+                            for i in arg_count..fixed_params {
+                                let default_idx = i - defaults_start;
+                                if default_idx < func.defaults.len() {
+                                    self.push_fast(func.defaults[default_idx].clone());
+                                }
+                            }
+                        }
+                        
+                        // 处理可变参数：将多余的参数打包成数组
+                        if func.has_variadic {
+                            let variadic_count = if arg_count > fixed_params {
+                                arg_count - fixed_params
+                            } else {
+                                0
+                            };
+                            
+                            // 收集可变参数
+                            let mut variadic_args = Vec::with_capacity(variadic_count);
+                            for _ in 0..variadic_count {
+                                variadic_args.push(self.pop_fast());
+                            }
+                            variadic_args.reverse();
+                            
+                            // 创建数组并压栈
+                            self.push_fast(Value::array(std::sync::Arc::new(parking_lot::Mutex::new(variadic_args))));
+                        }
+                        
+                        // 创建调用帧
+                        let base_slot = callee_idx + 1;
+                        self.frames.push(CallFrame {
+                            return_ip: self.ip as u32,
+                            base_slot: base_slot as u16,
+                            is_method_call: false,
+                        });
+                        
+                        self.current_base = base_slot;
+                        self.ip = func.chunk_index;
+                        continue;
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot call {}", callee.type_name())));
                     }
-                    // 回退到完整处理
-                    self.ip -= 2; // 回退 arg_count 字节
                 }
                 OP_RETURN => {
                     let return_value = self.pop_fast();
