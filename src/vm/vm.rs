@@ -5,16 +5,26 @@
 use crate::compiler::{Chunk, OpCode};
 use crate::i18n::{Locale, format_message, messages};
 use super::value::{Value, Iterator, IteratorSource, StructInstance, Function};
+use crate::stdlib::StdlibRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 /// 栈大小（预分配容量，避免运行时扩容）
 const STACK_SIZE: usize = 1024;
 
 /// 最大调用深度
 const MAX_FRAMES: usize = 64;
+
+/// 全局标准库注册表（延迟初始化）
+static STDLIB_REGISTRY: OnceLock<StdlibRegistry> = OnceLock::new();
+
+/// 获取标准库注册表
+fn get_stdlib_registry() -> &'static StdlibRegistry {
+    STDLIB_REGISTRY.get_or_init(|| StdlibRegistry::new())
+}
 
 /// 栈帧信息（用于栈追踪）
 #[derive(Debug, Clone)]
@@ -2167,6 +2177,33 @@ impl VM {
                         continue;
                     }
                     
+                    // 检查是否是标准库类实例
+                    if let Some(class_instance) = receiver.as_class() {
+                        let instance_guard = class_instance.lock();
+                        let class_name = instance_guard.class_name.clone();
+                        drop(instance_guard);
+                        
+                        let registry = get_stdlib_registry();
+                        if let Some((_, _)) = registry.find_class_module(&class_name) {
+                            // 是标准库类实例，从栈中获取参数
+                            let args_start = receiver_idx + 1;
+                            let args = self.stack[args_start..].to_vec();
+                            // 弹出参数和receiver
+                            self.stack.truncate(receiver_idx);
+                            
+                            // 调用标准库方法
+                            match registry.call_class_method(&receiver, &method_name, &args) {
+                                Ok(result) => {
+                                    self.push(result);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    return Err(self.runtime_error(&e));
+                                }
+                            }
+                        }
+                    }
+                    
                     // 否则执行类/结构体方法调用
                     if let Some(instance) = receiver.as_class() {
                         let instance = instance.lock();
@@ -2297,6 +2334,33 @@ impl VM {
                         )));
                     }
                     
+                    // 检查是否是标准库类实例
+                    if let Some(class_instance) = receiver.as_class() {
+                        let instance_guard = class_instance.lock();
+                        let class_name = instance_guard.class_name.clone();
+                        drop(instance_guard);
+                        
+                        let registry = get_stdlib_registry();
+                        if let Some((_, _)) = registry.find_class_module(&class_name) {
+                            // 是标准库类实例，从栈中获取参数
+                            let args_start = receiver_idx + 1;
+                            let args = self.stack[args_start..].to_vec();
+                            // 弹出参数和receiver
+                            self.stack.truncate(receiver_idx);
+                            
+                            // 调用标准库方法
+                            match registry.call_class_method(&receiver, &method_name, &args) {
+                                Ok(result) => {
+                                    self.push(result);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    return Err(self.runtime_error(&e));
+                                }
+                            }
+                        }
+                    }
+                    
                     // 否则执行类/结构体方法调用
                     if let Some(instance) = receiver.as_class() {
                         let instance = instance.lock();
@@ -2414,6 +2478,33 @@ impl VM {
                     // 获取 receiver（在参数下方）
                     let receiver_idx = self.stack.len() - arg_count - 1;
                     let receiver = self.stack[receiver_idx].clone();
+                    
+                    // 检查是否是标准库类实例
+                    if let Some(class_instance) = receiver.as_class() {
+                        let instance_guard = class_instance.lock();
+                        let class_name = instance_guard.class_name.clone();
+                        drop(instance_guard);
+                        
+                        let registry = get_stdlib_registry();
+                        if let Some((_, _)) = registry.find_class_module(&class_name) {
+                            // 是标准库类实例，从栈中获取参数
+                            let args_start = receiver_idx + 1;
+                            let args = self.stack[args_start..].to_vec();
+                            // 弹出参数和receiver
+                            self.stack.truncate(receiver_idx);
+                            
+                            // 调用标准库方法
+                            match registry.call_class_method(&receiver, &method_name, &args) {
+                                Ok(result) => {
+                                    self.push(result);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    return Err(self.runtime_error(&e));
+                                }
+                            }
+                        }
+                    }
                     
                     // 检查是否是类型引用（静态方法调用）
                     if let Some(class_name) = receiver.as_type_ref() {
@@ -3501,6 +3592,28 @@ impl VM {
                         return Err(self.runtime_error("Invalid class name"));
                     };
                     
+                    // 检查是否是标准库类
+                    let registry = get_stdlib_registry();
+                    if let Some((_, _)) = registry.find_class_module(&class_name) {
+                        // 是标准库类，从栈中获取参数
+                        let args_start = self.stack.len() - arg_count;
+                        let args = self.stack[args_start..].to_vec();
+                        // 弹出参数
+                        self.stack.truncate(args_start);
+                        
+                        // 调用标准库构造函数
+                        match registry.create_class_instance(&class_name, &args) {
+                            Ok(instance) => {
+                                self.push(instance);
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(self.runtime_error(&e));
+                            }
+                        }
+                    }
+                    
+                    // 不是标准库类，按普通类处理
                     // 获取类型信息
                     let type_info = match self.chunk.get_type(&class_name) {
                         Some(t) => t.clone(),
