@@ -21,6 +21,8 @@ pub struct Symbol {
     pub depth: usize,
     /// 是否被闭包捕获
     pub is_captured: bool,
+    /// 函数参数名列表（仅函数类型有效，用于命名参数重排）
+    pub param_names: Option<Vec<String>>,
 }
 
 impl Symbol {
@@ -33,6 +35,20 @@ impl Symbol {
             slot,
             depth,
             is_captured: false,
+            param_names: None,
+        }
+    }
+    
+    /// Create a function symbol with parameter names
+    pub fn new_function(name: String, ty: Type, slot: usize, depth: usize, param_names: Vec<String>) -> Self {
+        Self {
+            name,
+            ty,
+            is_const: true,  // 函数默认是常量
+            slot,
+            depth,
+            is_captured: false,
+            param_names: Some(param_names),
         }
     }
 }
@@ -161,6 +177,29 @@ impl SymbolTable {
 
         let slot = self.current_slot;
         let symbol = Symbol::new(name, ty, is_const, slot, self.scope_depth);
+        self.symbols.push(symbol);
+        self.current_slot += 1;
+
+        Ok(slot)
+    }
+    
+    /// 定义函数符号（包含参数名列表，用于命名参数重排）
+    pub fn define_function(&mut self, name: String, ty: Type, param_names: Vec<String>) -> Result<usize, String> {
+        // Check if symbol already exists in current scope
+        for symbol in self.symbols.iter().rev() {
+            if symbol.depth < self.scope_depth {
+                break;
+            }
+            if symbol.name == name {
+                return Err(format!(
+                    "Function '{}' is already defined in this scope",
+                    name
+                ));
+            }
+        }
+
+        let slot = self.current_slot;
+        let symbol = Symbol::new_function(name, ty, slot, self.scope_depth, param_names);
         self.symbols.push(symbol);
         self.current_slot += 1;
 

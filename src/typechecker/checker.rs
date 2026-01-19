@@ -572,9 +572,53 @@ impl TypeChecker {
             
             Expr::Call { callee, args, span } => {
                 let callee_ty = self.infer_expr(callee)?;
-                // 提取参数表达式（命名参数的名称在类型检查时忽略）
-                let arg_exprs: Vec<&Expr> = args.iter().map(|(_, e)| e).collect();
-                self.infer_call(&callee_ty, &arg_exprs, *span)
+                
+                // 检查是否有命名参数
+                let has_named_args = args.iter().any(|(name, _)| name.is_some());
+                
+                if has_named_args {
+                    // 尝试获取函数的参数名列表进行重排
+                    let param_names = if let Expr::Identifier { name, .. } = callee.as_ref() {
+                        self.env.lookup_function(name).map(|f| f.param_names.clone())
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(param_names) = param_names {
+                        // 根据参数名重排参数表达式
+                        let mut positional_args: Vec<&Expr> = Vec::new();
+                        let mut named_args: std::collections::HashMap<&str, &Expr> = std::collections::HashMap::new();
+                        
+                        for (name, arg) in args {
+                            if let Some(n) = name {
+                                named_args.insert(n.as_str(), arg);
+                            } else {
+                                positional_args.push(arg);
+                            }
+                        }
+                        
+                        // 按照函数定义的参数顺序重排
+                        let mut reordered_args: Vec<&Expr> = Vec::new();
+                        for (idx, param_name) in param_names.iter().enumerate() {
+                            if idx < positional_args.len() {
+                                reordered_args.push(positional_args[idx]);
+                            } else if let Some(arg) = named_args.get(param_name.as_str()) {
+                                reordered_args.push(*arg);
+                            }
+                            // 缺失的参数在 infer_call 中会报错
+                        }
+                        
+                        self.infer_call(&callee_ty, &reordered_args, *span)
+                    } else {
+                        // 没有参数名信息，按原顺序检查
+                        let arg_exprs: Vec<&Expr> = args.iter().map(|(_, e)| e).collect();
+                        self.infer_call(&callee_ty, &arg_exprs, *span)
+                    }
+                } else {
+                    // 纯位置参数，按顺序检查
+                    let arg_exprs: Vec<&Expr> = args.iter().map(|(_, e)| e).collect();
+                    self.infer_call(&callee_ty, &arg_exprs, *span)
+                }
             }
             
             Expr::Index { object, index, span } => {

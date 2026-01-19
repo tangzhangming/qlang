@@ -1206,11 +1206,14 @@ impl Compiler {
                 };
                 self.chunk.constants[func_index as usize] = Value::function(Arc::new(func));
                 
-                // 13. 在当前作用域定义函数变量
+                // 13. 在当前作用域定义函数变量（包含参数名列表，用于命名参数重排）
                 self.chunk.write_op(OpCode::Const, span.line);
                 self.chunk.write_u16(func_index, span.line);
-                if let Err(msg) = self.symbols.define(name.clone(), crate::types::Type::Unknown, false) {
-                self.errors.push(CompileError::new(msg, *span));
+                
+                // 收集参数名列表
+                let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+                if let Err(msg) = self.symbols.define_function(name.clone(), crate::types::Type::Unknown, param_names) {
+                    self.errors.push(CompileError::new(msg, *span));
                 }
                 // 函数值已经在栈顶，define 会为它分配槽位
             }
@@ -2098,13 +2101,51 @@ impl Compiler {
                 self.compile_expr(callee);
                 
                 // 2. 编译所有参数（依次压栈）
-                // 如果有命名参数，需要重新排列
+                // 如果有命名参数，需要根据函数定义重新排列参数顺序
                 if has_named_args {
                     // 命名参数调用：需要根据函数定义重排参数
-                    // 这里简单处理：编译时按顺序压栈，运行时重排
-                    // TODO: 完整实现需要在编译时查找函数定义并重排
-                    for (_, arg) in args {
-                        self.compile_expr(arg);
+                    // 尝试获取函数的参数名列表
+                    let param_names = if let Expr::Identifier { name, .. } = callee.as_ref() {
+                        self.symbols.resolve(name).and_then(|s| s.param_names.clone())
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(param_names) = param_names {
+                        // 有参数名信息，进行重排
+                        // 1. 分离位置参数和命名参数
+                        let mut positional_args: Vec<&Expr> = Vec::new();
+                        let mut named_args: std::collections::HashMap<&str, &Expr> = std::collections::HashMap::new();
+                        
+                        for (name, arg) in args {
+                            if let Some(n) = name {
+                                named_args.insert(n.as_str(), arg);
+                            } else {
+                                positional_args.push(arg);
+                            }
+                        }
+                        
+                        // 2. 按照函数定义的参数顺序编译参数
+                        for (idx, param_name) in param_names.iter().enumerate() {
+                            if idx < positional_args.len() {
+                                // 使用位置参数
+                                self.compile_expr(positional_args[idx]);
+                            } else if let Some(arg) = named_args.get(param_name.as_str()) {
+                                // 使用命名参数
+                                self.compile_expr(arg);
+                            } else {
+                                // 参数缺失，报错（或者依赖默认参数处理）
+                                let msg = format!("Missing argument for parameter '{}'", param_name);
+                                self.errors.push(CompileError::new(msg, *span));
+                                // 压入 null 占位
+                                self.chunk.write_constant(Value::null(), span.line);
+                            }
+                        }
+                    } else {
+                        // 没有参数名信息，按原顺序编译（可能产生错误结果）
+                        for (_, arg) in args {
+                            self.compile_expr(arg);
+                        }
                     }
                 } else {
                     // 位置参数：按顺序压栈
