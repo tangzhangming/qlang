@@ -172,6 +172,19 @@ impl Compiler {
 
     /// 编译程序
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, Vec<CompileError>> {
+        // 第一遍：预注册所有函数名（使前向引用成为可能）
+        // 这允许 main 函数调用在它之后定义的函数
+        for stmt in &program.statements {
+            if let Stmt::FnDef { name, .. } = stmt {
+                // 预留常量池位置
+                let func_index = self.chunk.constants.len() as u16;
+                self.chunk.constants.push(Value::null());
+                // 预注册函数名
+                self.chunk.register_named_function(name.clone(), func_index);
+            }
+        }
+        
+        // 第二遍：实际编译所有语句
         for stmt in &program.statements {
             self.compile_stmt(stmt);
         }
@@ -1111,15 +1124,19 @@ impl Compiler {
                 self.chunk.write_op(OpCode::Throw, span.line);
             }
             Stmt::FnDef { name, type_params: _, where_clauses: _, params, return_type: _, body, visibility: _, span } => {
-                // 编译命名函数定义（支持递归）
-                // 策略：先在常量池中预留位置并注册函数名，然后编译函数体
+                // 编译命名函数定义（支持递归和前向引用）
                 
-                // 1. 在常量池中预留位置（用 Null 占位）
-                let func_index = self.chunk.constants.len() as u16;
-                self.chunk.constants.push(Value::null());
-                
-                // 2. 预先注册函数名（使递归调用能找到函数）
-                self.chunk.register_named_function(name.clone(), func_index);
+                // 1. 检查是否已经预注册了这个函数（在 compile 第一遍中）
+                let func_index = if let Some(idx) = self.chunk.get_named_function(name) {
+                    // 使用已预留的索引
+                    idx
+                } else {
+                    // 未预注册，创建新的（兼容直接调用 compile_stmt 的情况）
+                    let idx = self.chunk.constants.len() as u16;
+                    self.chunk.constants.push(Value::null());
+                    self.chunk.register_named_function(name.clone(), idx);
+                    idx
+                };
                 
                 // 3. 写一个跳转指令跳过函数体
                 let jump_over = self.chunk.write_jump(OpCode::Jump, span.line);
