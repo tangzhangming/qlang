@@ -1321,7 +1321,15 @@ impl Parser {
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选，init 构造函数没有返回类型）
-        let return_type = if name != "init" && !self.check(&TokenKind::LeftBrace) && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::Semicolon) {
+        let return_type = if name == "init" {
+            // 构造函数不能有返回类型
+            // 检查用户是否错误地添加了返回类型
+            if !self.check(&TokenKind::LeftBrace) && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::Semicolon) {
+                let msg = format_message(messages::ERR_COMPILE_CONSTRUCTOR_RETURN, self.locale, &[]);
+                return Err(ParseError::new(msg, self.current_span()));
+            }
+            None
+        } else if !self.check(&TokenKind::LeftBrace) && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::Semicolon) {
             Some(self.parse_type_annotation()?)
         } else {
             None

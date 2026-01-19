@@ -21,6 +21,7 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_CONTINUE_OUTSIDE_LOOP => "'continue' can only be used inside a loop",
         ERR_COMPILE_UNKNOWN_FUNCTION => "Unknown function: '{}'",
         ERR_COMPILE_CONSTRUCTOR_OVERLOAD => "Constructor overloading is not allowed. Only one 'init' method is permitted",
+        ERR_COMPILE_CONSTRUCTOR_RETURN => "Constructor 'init' cannot have a return type",
         
         // Type check errors
         ERR_TYPE_UNDEFINED_TYPE => "Undefined type: '{}'",
