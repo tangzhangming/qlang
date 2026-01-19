@@ -145,6 +145,8 @@ pub struct VM {
     /// 内联缓存（方法调用优化）
     /// 缓存 (类型名, 方法名) -> 函数索引
     inline_cache: std::collections::HashMap<(String, String), u16>,
+    /// 回调通道（用于处理异步回调）
+    callback_channel: Option<Arc<crate::stdlib::CallbackChannel>>,
 }
 
 impl VM {
@@ -162,6 +164,7 @@ impl VM {
             vtable_registry: super::vtable::VTableRegistry::new(),
             preempt_flag: None,
             inline_cache: std::collections::HashMap::with_capacity(64),
+            callback_channel: None,
         }
     }
     
@@ -179,6 +182,7 @@ impl VM {
             vtable_registry: super::vtable::VTableRegistry::new(),
             preempt_flag: Some(preempt_flag),
             inline_cache: std::collections::HashMap::with_capacity(64),
+            callback_channel: None,
         }
     }
     
@@ -1919,17 +1923,24 @@ impl VM {
                 OpCode::Return => {
                     // 获取返回值
                     let return_value = self.pop_fast();
-                    
+
                     // 如果没有调用帧，说明是顶层返回
                     if self.frames.is_empty() {
                         // 压回返回值（供外部使用）
                         self.push_fast(return_value);
                         return Ok(());
                     }
-                    
+
                     // 弹出调用帧
                     let frame = unsafe { self.frames.pop().unwrap_unchecked() };
-                    
+
+                    // 检查是否是sentinel帧（return_ip == u32::MAX）
+                    if frame.return_ip == u32::MAX {
+                        // 到达sentinel帧，压回返回值并停止执行
+                        self.push_fast(return_value);
+                        return Ok(());
+                    }
+
                     // 清理栈：移除函数值/receiver 和所有局部变量
                     // 对于方法调用：base_slot 指向 receiver，截断到 base_slot
                     // 对于函数调用：base_slot 指向第一个参数，截断到 base_slot - 1（移除函数值）
@@ -2195,7 +2206,24 @@ impl VM {
                             if registry.needs_callback(&class_name, &method_name) {
                                 // 需要回调支持的方法 - 创建回调通道
                                 use crate::stdlib::CallbackChannel;
-                                let callback_channel = Arc::new(CallbackChannel::new());
+
+                                // 获取或创建回调通道
+                                let callback_channel = if let Some(ch) = &self.callback_channel {
+                                    ch.clone()
+                                } else {
+                                    // 第一次创建回调通道时启动处理线程
+                                    let new_channel = Arc::new(CallbackChannel::new());
+                                    let chunk = self.chunk.clone();
+                                    let locale = self.locale;
+                                    let channel = new_channel.clone();
+                                    std::thread::spawn(move || {
+                                        Self::callback_handler_loop(chunk, locale, channel);
+                                    });
+                                    // 保存到 VM 实例
+                                    self.callback_channel = Some(new_channel.clone());
+                                    new_channel
+                                };
+
                                 match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
                                     Ok(result) => {
                                         self.push(result);
@@ -2368,7 +2396,24 @@ impl VM {
                             if registry.needs_callback(&class_name, &method_name) {
                                 // 需要回调支持的方法 - 创建回调通道
                                 use crate::stdlib::CallbackChannel;
-                                let callback_channel = Arc::new(CallbackChannel::new());
+
+                                // 获取或创建回调通道
+                                let callback_channel = if let Some(ch) = &self.callback_channel {
+                                    ch.clone()
+                                } else {
+                                    // 第一次创建回调通道时启动处理线程
+                                    let new_channel = Arc::new(CallbackChannel::new());
+                                    let chunk = self.chunk.clone();
+                                    let locale = self.locale;
+                                    let channel = new_channel.clone();
+                                    std::thread::spawn(move || {
+                                        Self::callback_handler_loop(chunk, locale, channel);
+                                    });
+                                    // 保存到 VM 实例
+                                    self.callback_channel = Some(new_channel.clone());
+                                    new_channel
+                                };
+
                                 match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
                                     Ok(result) => {
                                         self.push(result);
@@ -2529,7 +2574,24 @@ impl VM {
                             if registry.needs_callback(&class_name, &method_name) {
                                 // 需要回调支持的方法 - 创建回调通道
                                 use crate::stdlib::CallbackChannel;
-                                let callback_channel = Arc::new(CallbackChannel::new());
+
+                                // 获取或创建回调通道
+                                let callback_channel = if let Some(ch) = &self.callback_channel {
+                                    ch.clone()
+                                } else {
+                                    // 第一次创建回调通道时启动处理线程
+                                    let new_channel = Arc::new(CallbackChannel::new());
+                                    let chunk = self.chunk.clone();
+                                    let locale = self.locale;
+                                    let channel = new_channel.clone();
+                                    std::thread::spawn(move || {
+                                        Self::callback_handler_loop(chunk, locale, channel);
+                                    });
+                                    // 保存到 VM 实例
+                                    self.callback_channel = Some(new_channel.clone());
+                                    new_channel
+                                };
+
                                 match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
                                     Ok(result) => {
                                         self.push(result);
@@ -6538,6 +6600,89 @@ impl VM {
         
         info.vtable = vtable;
         Some(info)
+    }
+
+    /// 回调处理循环
+    /// 在单独的线程中运行，处理来自 CallbackChannel 的回调请求
+    fn callback_handler_loop(
+        chunk: Arc<crate::compiler::bytecode::Chunk>,
+        locale: crate::i18n::Locale,
+        callback_channel: Arc<crate::stdlib::CallbackChannel>,
+    ) {
+        use crate::stdlib::{CallbackRequest, CallbackResponse};
+
+        loop {
+            match callback_channel.request_rx.recv() {
+                Ok(CallbackRequest::Execute { handler, args, response_tx }) => {
+                    // 执行回调函数
+                    let result = Self::execute_callback(chunk.clone(), locale, handler, args);
+
+                    // 发送响应（忽略错误）
+                    let _ = response_tx.send(result);
+                }
+                Ok(CallbackRequest::Stop) => {
+                    // 停止回调循环
+                    break;
+                }
+                Err(_) => {
+                    // 通道关闭，退出循环
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 执行回调函数
+    fn execute_callback(
+        chunk: Arc<crate::compiler::bytecode::Chunk>,
+        locale: crate::i18n::Locale,
+        handler: Value,
+        args: Vec<Value>,
+    ) -> crate::stdlib::CallbackResponse {
+        use crate::stdlib::CallbackResponse;
+
+        // 创建新的 VM 实例来执行回调
+        let mut vm = VM::new(chunk, locale);
+
+        // 将 handler 压入栈
+        vm.push(handler.clone());
+
+        // 将参数压入栈
+        for arg in &args {
+            vm.push(arg.clone());
+        }
+
+        // 获取函数信息
+        let func = match handler.as_function() {
+            Some(f) => f.clone(),
+            None => {
+                return CallbackResponse::Error("Handler is not a function".to_string());
+            }
+        };
+
+        // 栈布局: [function, arg1, arg2, ...]
+        // base_slot 应该指向第一个参数的位置（function + 1）
+        let callee_idx = vm.stack.len() - args.len() - 1;
+        let base_slot = callee_idx + 1;
+
+        // 不使用帧 - 直接设置当前base和IP
+        // 函数将作为顶层执行，Return时frames为空会自动停止
+        vm.current_base = base_slot;
+        vm.ip = func.chunk_index;
+
+        // 运行VM，当返回到sentinel帧时会自动停止（因为return_ip == u32::MAX）
+        match vm.run() {
+            Ok(_) => {
+                // 函数已返回，返回值应该在栈顶
+                let return_value = if !vm.stack.is_empty() {
+                    vm.stack.pop().unwrap_or(Value::null())
+                } else {
+                    Value::null()
+                };
+                CallbackResponse::Success(return_value)
+            }
+            Err(e) => CallbackResponse::Error(e.message),
+        }
     }
 }
 
