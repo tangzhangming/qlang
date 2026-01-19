@@ -630,10 +630,19 @@ impl TypeChecker {
                 
                 // 设置返回类型
                 let ret_ty = return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void);
-                self.env.set_return_type(Some(ret_ty));
+                self.env.set_return_type(Some(ret_ty.clone()));
                 
                 // 检查函数体
                 self.check_stmt(body)?;
+                
+                // 检查是否缺少 return 语句
+                // 如果函数有非 void 返回类型，必须确保所有路径都返回
+                if ret_ty != Type::Void && !self.stmt_returns(body) {
+                    return Err(TypeError::new(
+                        TypeErrorKind::MissingReturn(ret_ty),
+                        *span,
+                    ));
+                }
                 
                 self.env.set_return_type(None);
                 self.in_function = was_in_function;
@@ -1467,6 +1476,57 @@ impl TypeChecker {
             is_method: true,
             owner_type: None,
         })).collect()
+    }
+    
+    /// 检查语句是否一定会返回（即所有执行路径都以 return 结尾）
+    fn stmt_returns(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return { .. } => true,
+            Stmt::Throw { .. } => true, // throw 也终止执行
+            Stmt::Block { statements, .. } => {
+                // 块中任何一条语句一定返回，则块一定返回
+                for s in statements {
+                    if self.stmt_returns(s) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Stmt::If { then_branch, else_branch, .. } => {
+                // if-else 都有且都一定返回，则整个 if 一定返回
+                let then_returns = self.stmt_returns(then_branch);
+                if let Some(else_stmt) = else_branch {
+                    then_returns && self.stmt_returns(else_stmt)
+                } else {
+                    false // 没有 else 分支，不能保证一定返回
+                }
+            }
+            Stmt::Match { arms, .. } => {
+                // 所有 match arm 都一定返回，则 match 一定返回
+                // 注意：需要检查是否是穷举的，这里简化处理，假设有 _ 模式则穷举
+                if arms.is_empty() {
+                    return false;
+                }
+                arms.iter().all(|arm| self.stmt_returns(&arm.body))
+            }
+            Stmt::TryCatch { try_block, catch_block, .. } => {
+                // try 和 catch 都一定返回，则整个 try-catch 一定返回
+                self.stmt_returns(try_block) && self.stmt_returns(catch_block)
+            }
+            Stmt::ForLoop { .. } | Stmt::ForIn { .. } => {
+                // 循环可能不执行，不能保证返回
+                false
+            }
+            Stmt::While { condition, body, .. } => {
+                // 无限循环 (condition == None) 如果内部有 return 则一定返回
+                if condition.is_none() {
+                    self.stmt_returns(body)
+                } else {
+                    false // 有条件的循环可能不执行
+                }
+            }
+            _ => false, // 其他语句不保证返回
+        }
     }
 }
 

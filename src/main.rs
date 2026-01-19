@@ -322,7 +322,8 @@ fn run_with_context(
     main_file: Option<&Path>,
 ) -> Result<(), String> {
     // 解析主程序
-    let mut program = parse_source(source, locale)?;
+    let mut program = parse_source(source, locale)
+        .map_err(|e| format!("[语法错误/Syntax Error]\n{}", e))?;
     
     // 如果有额外的语句（来自依赖），添加到程序开头
     if let Some(mut extra) = extra_statements {
@@ -335,11 +336,12 @@ fn run_with_context(
     if type_check {
         let mut type_checker = TypeChecker::with_context(context);
         type_checker.check_program(&program).map_err(|errors| {
-            errors
+            let error_list = errors
                 .iter()
-                .map(|e| format!("[{}:{}] {}", e.span.line, e.span.column, e))
+                .map(|e| format!("  [{}:{}] {}", e.span.line, e.span.column, e))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n");
+            format!("[类型检查错误/Type Error]\n{}", error_list)
         })?;
         
         // 收集泛型定义用于单态化
@@ -353,17 +355,18 @@ fn run_with_context(
     // 编译
     let mut compiler = Compiler::new(locale);
     let chunk = compiler.compile(&program).map_err(|errors| {
-        errors
+        let error_list = errors
             .iter()
-            .map(|e| format!("[{}:{}] {}", e.span.line, e.span.column, e.message))
+            .map(|e| format!("  [{}:{}] {}", e.span.line, e.span.column, e.message))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        format!("[编译错误/Compile Error]\n{}", error_list)
     })?;
     
     // 执行（从 main 函数开始）
     let chunk_arc = std::sync::Arc::new(chunk);
     let mut vm = VM::new(chunk_arc, locale);
-    vm.run().map_err(|e| format!("[line {}] {}", e.line, e.message))?;
+    vm.run().map_err(|e| format!("[运行时错误/Runtime Error]\n  [line {}] {}", e.line, e.message))?;
     
     Ok(())
 }
@@ -434,7 +437,7 @@ fn run_file(path: &str, locale: Locale) {
     let main_program = match parse_source(&source, locale) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{}", format_message(messages::MSG_CLI_ERROR, locale, &[&e]));
+            eprintln!("[语法错误/Syntax Error] {}\n{}", path, e);
             process::exit(1);
         }
     };
@@ -443,13 +446,13 @@ fn run_file(path: &str, locale: Locale) {
     let extra_statements = match load_dependencies(&main_program, file_path, project.as_ref(), locale) {
         Ok(stmts) => Some(stmts),
         Err(e) => {
-            eprintln!("{}", format_message(messages::MSG_CLI_ERROR, locale, &[&e]));
+            eprintln!("[导入错误/Import Error]\n  {}", e);
             process::exit(1);
         }
     };
     
     if let Err(e) = run_with_context(&source, locale, context, true, extra_statements, Some(file_path)) {
-        eprintln!("{}", format_message(messages::MSG_CLI_ERROR, locale, &[&e]));
+        eprintln!("{}", e);
         process::exit(1);
     }
 }
