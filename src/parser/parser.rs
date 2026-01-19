@@ -2995,11 +2995,26 @@ impl Parser {
     fn parse_fn_params(&mut self, allow_field_modifiers: bool) -> Result<Vec<FnParam>, ParseError> {
         let mut params = Vec::new();
         
+        // 跳过开头的换行符
+        while self.check(&TokenKind::Newline) {
+            self.advance();
+        }
+        
         if self.check(&TokenKind::RightParen) {
             return Ok(params);
         }
         
         loop {
+            // 跳过参数前的换行符
+            while self.check(&TokenKind::Newline) {
+                self.advance();
+            }
+            
+            // 再次检查是否到达参数列表末尾
+            if self.check(&TokenKind::RightParen) {
+                break;
+            }
+            
             let start_span = self.current_span();
             
             // 检查是否有字段修饰符（可选的可见性 + var/val/const）
@@ -3075,6 +3090,10 @@ impl Parser {
                 break;
             }
             self.advance(); // 消费 ','
+            // 跳过逗号后的换行符
+            while self.check(&TokenKind::Newline) {
+                self.advance();
+            }
         }
         
         Ok(params)
