@@ -24,6 +24,7 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_CONSTRUCTOR_RETURN => "Constructor 'init' cannot have a return type",
         ERR_COMPILE_CONSTRUCTOR_VISIBILITY => "Constructor 'init' must be public (default visibility)",
         ERR_COMPILE_EXPECTED_VAR_OR_FUNC => "Expected 'var', 'const', or 'func' in class body",
+        ERR_COMPILE_CATCH_MISSING_TYPE => "Catch parameter must have a type annotation, e.g. catch (e:Exception)",
         
         // Type check errors
         ERR_TYPE_UNDEFINED_TYPE => "Undefined type: '{}'",

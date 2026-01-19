@@ -576,6 +576,7 @@ pub enum Stmt {
     TryCatch {
         try_block: Box<Stmt>,
         catch_param: Option<String>,  // catch 的参数名，如 catch(e)
+        catch_type: Option<String>,   // catch 的异常类型，如 catch(e:Exception)
         catch_block: Box<Stmt>,
         finally_block: Option<Box<Stmt>>,
         span: Span,

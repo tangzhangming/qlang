@@ -110,6 +110,26 @@ impl PackageResolver {
                 "getExceptionMessage".to_string(),
             ],
         );
+        
+        // std.net.tcp - Rust 内置模块，提供 TCP 网络功能
+        self.builtin_modules.insert(
+            "std.net.tcp".to_string(),
+            vec![
+                "TCPSocket".to_string(),
+                "TCPListener".to_string(),
+            ],
+        );
+        
+        // std.net.http - Rust 内置模块，提供 HTTP 网络功能
+        self.builtin_modules.insert(
+            "std.net.http".to_string(),
+            vec![
+                "HttpClient".to_string(),
+                "HttpServer".to_string(),
+                "HttpRequest".to_string(),
+                "HttpResponse".to_string(),
+            ],
+        );
     }
     
     /// 解析导入声明

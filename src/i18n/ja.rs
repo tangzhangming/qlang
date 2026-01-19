@@ -20,6 +20,7 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_BREAK_OUTSIDE_LOOP => "'break' はループ内でのみ使用できます",
         ERR_COMPILE_CONTINUE_OUTSIDE_LOOP => "'continue' はループ内でのみ使用できます",
         ERR_COMPILE_UNKNOWN_FUNCTION => "未知の関数: '{}'",
+        ERR_COMPILE_CATCH_MISSING_TYPE => "catch パラメータには型注釈が必要です。例: catch (e:Exception)",
         
         // 型チェックエラー
         ERR_TYPE_UNDEFINED_TYPE => "未定義の型: '{}'",

@@ -24,6 +24,7 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_CONSTRUCTOR_RETURN => "构造函数 'init' 不能有返回类型",
         ERR_COMPILE_CONSTRUCTOR_VISIBILITY => "构造函数 'init' 必须是 public（默认可见性）",
         ERR_COMPILE_EXPECTED_VAR_OR_FUNC => "类中只能定义 'var'、'const' 字段或 'func' 方法",
+        ERR_COMPILE_CATCH_MISSING_TYPE => "catch 参数必须指定类型，例如 catch (e:Exception)",
         
         // 类型检查错误
         ERR_TYPE_UNDEFINED_TYPE => "未定义的类型: '{}'",

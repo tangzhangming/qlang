@@ -42,26 +42,216 @@ pub struct TypeChecker {
 impl TypeChecker {
     /// 创建新的类型检查器
     pub fn new() -> Self {
-        Self {
+        let mut checker = Self {
             env: TypeEnvironment::new(),
             solver: ConstraintSolver::new(),
             errors: Vec::new(),
             in_function: false,
             in_loop: false,
             context: CompileContext::default(),
-        }
+        };
+        checker.register_stdlib_types();
+        checker
     }
     
     /// 创建带上下文的类型检查器
     pub fn with_context(context: CompileContext) -> Self {
-        Self {
+        let mut checker = Self {
             env: TypeEnvironment::new(),
             solver: ConstraintSolver::new(),
             errors: Vec::new(),
             in_function: false,
             in_loop: false,
             context,
+        };
+        checker.register_stdlib_types();
+        checker
+    }
+    
+    /// 注册标准库类型
+    fn register_stdlib_types(&mut self) {
+        // std.net.tcp.TCPSocket
+        self.register_stdlib_class(
+            "TCPSocket",
+            vec![
+                ("send", vec![("data", Type::Slice { element_type: Box::new(Type::Int) })], Type::Int),
+                ("receive", vec![("buffer", Type::Slice { element_type: Box::new(Type::Int) })], Type::Int),
+                ("close", vec![], Type::Null),
+                ("setReadTimeout", vec![("timeout_ms", Type::Int)], Type::Null),
+                ("setWriteTimeout", vec![("timeout_ms", Type::Int)], Type::Null),
+                ("setNoDelay", vec![("enabled", Type::Bool)], Type::Null),
+                ("shutdown", vec![], Type::Null),
+            ],
+            Some(vec![
+                ("host", Type::String),
+                ("port", Type::Int),
+            ]),
+        );
+        
+        // std.net.tcp.TCPListener
+        self.register_stdlib_class(
+            "TCPListener",
+            vec![
+                ("accept", vec![], Type::Class("TCPSocket".to_string())),
+                ("close", vec![], Type::Null),
+            ],
+            Some(vec![
+                ("host", Type::String),
+                ("port", Type::Int),
+            ]),
+        );
+        
+        // std.net.http.HttpClient
+        self.register_stdlib_class(
+            "HttpClient",
+            vec![
+                ("get", vec![("url", Type::String)], Type::Class("HttpResponse".to_string())),
+                ("post", vec![("url", Type::String)], Type::Class("HttpResponse".to_string())),
+                ("put", vec![("url", Type::String)], Type::Class("HttpResponse".to_string())),
+                ("delete", vec![("url", Type::String)], Type::Class("HttpResponse".to_string())),
+                ("request", vec![("method", Type::String), ("url", Type::String)], Type::Class("HttpResponse".to_string())),
+                ("setTimeout", vec![("timeout_ms", Type::Int)], Type::Null),
+                ("close", vec![], Type::Null),
+            ],
+            None, // 无参数或可选参数的构造函数
+        );
+        
+        // std.net.http.HttpServer
+        self.register_stdlib_class(
+            "HttpServer",
+            vec![
+                ("listen", vec![("handler", Type::Unknown)], Type::Null),  // handler 是函数，使用 unknown
+                ("stop", vec![], Type::Null),
+            ],
+            Some(vec![
+                ("host", Type::String),
+                ("port", Type::Int),
+            ]),
+        );
+        
+        // std.net.http.HttpRequest
+        self.register_stdlib_class(
+            "HttpRequest",
+            vec![
+                ("getHeader", vec![("name", Type::String)], Type::String),
+                ("getQuery", vec![("name", Type::String)], Type::String),
+            ],
+            None,
+        );
+        
+        // std.net.http.HttpResponse
+        self.register_stdlib_class(
+            "HttpResponse",
+            vec![
+                ("text", vec![], Type::String),
+                ("setHeader", vec![("name", Type::String), ("value", Type::String)], Type::Null),
+            ],
+            Some(vec![
+                ("status", Type::Int),
+            ]),
+        );
+        
+        // std.lang.Exception 及其子类
+        for exc_name in &[
+            "Throwable", "Error", "Exception", 
+            "RuntimeException", "NullPointerException", "IndexOutOfBoundsException",
+            "IllegalArgumentException", "ArithmeticException", "ClassCastException",
+            "IOException", "FileNotFoundException", "NetworkException", "TimeoutException",
+        ] {
+            self.register_stdlib_class_with_fields(
+                exc_name,
+                vec![
+                    ("toString", vec![], Type::String),
+                    ("getMessage", vec![], Type::String),
+                ],
+                Some(vec![("message", Type::String)]),
+                vec![("message", Type::String)],  // 字段
+            );
         }
+    }
+    
+    /// 注册标准库类
+    fn register_stdlib_class(
+        &mut self,
+        name: &str,
+        methods: Vec<(&str, Vec<(&str, Type)>, Type)>,
+        init_params: Option<Vec<(&str, Type)>>,
+    ) {
+        self.register_stdlib_class_with_fields(name, methods, init_params, vec![]);
+    }
+    
+    /// 注册标准库类（带字段）
+    fn register_stdlib_class_with_fields(
+        &mut self,
+        name: &str,
+        methods: Vec<(&str, Vec<(&str, Type)>, Type)>,
+        init_params: Option<Vec<(&str, Type)>>,
+        fields: Vec<(&str, Type)>,
+    ) {
+        let mut method_map = HashMap::new();
+        let mut field_map = HashMap::new();
+        
+        // 注册字段
+        for (field_name, field_type) in fields {
+            field_map.insert(field_name.to_string(), FieldInfo {
+                name: field_name.to_string(),
+                ty: field_type,
+                is_mutable: true,
+                visibility: Visibility::Public,
+            });
+        }
+        
+        // 注册构造函数
+        if let Some(params) = init_params {
+            let param_names: Vec<String> = params.iter().map(|(n, _)| n.to_string()).collect();
+            let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+            let required = param_types.len();
+            
+            method_map.insert("init".to_string(), FunctionInfo {
+                name: "init".to_string(),
+                type_params: vec![],
+                param_types,
+                param_names,
+                required_params: required,
+                return_type: Type::Class(name.to_string()),
+                is_method: true,
+                owner_type: Some(name.to_string()),
+            });
+        }
+        
+        // 注册方法
+        for (method_name, params, return_type) in methods {
+            let param_names: Vec<String> = params.iter().map(|(n, _)| n.to_string()).collect();
+            let param_types: Vec<Type> = params.iter().map(|(_, t)| t.clone()).collect();
+            let required = param_types.len();
+            
+            method_map.insert(method_name.to_string(), FunctionInfo {
+                name: method_name.to_string(),
+                type_params: vec![],
+                param_types,
+                param_names,
+                required_params: required,
+                return_type,
+                is_method: true,
+                owner_type: Some(name.to_string()),
+            });
+        }
+        
+        let class_info = ClassInfo {
+            name: name.to_string(),
+            type_params: vec![],
+            parent: None,
+            interfaces: vec![],
+            traits: vec![],
+            fields: field_map,
+            methods: method_map,
+            static_fields: HashMap::new(),
+            static_methods: HashMap::new(),
+            is_abstract: false,
+        };
+        
+        // 忽略注册错误（可能已存在）
+        let _ = self.env.register_type(name.to_string(), TypeInfo::Class(class_info));
     }
     
     /// 设置编译上下文
@@ -78,22 +268,22 @@ impl TypeChecker {
     fn builtin_function_type(name: &str) -> Type {
         match name {
             "print" | "println" => Type::Function {
-                param_types: vec![Type::Dynamic],
+                param_types: vec![Type::Unknown],  // 可接收任何类型
                 return_type: Box::new(Type::Void),
                 required_params: 1,
             },
             "typeof" => Type::Function {
-                param_types: vec![Type::Dynamic],
+                param_types: vec![Type::Unknown],  // 可接收任何类型
                 return_type: Box::new(Type::String),
                 required_params: 1,
             },
             "typeinfo" => Type::Function {
-                param_types: vec![Type::Dynamic],
-                return_type: Box::new(Type::Dynamic), // 返回 RuntimeTypeInfo 对象
+                param_types: vec![Type::Unknown],  // 可接收任何类型
+                return_type: Box::new(Type::Unknown), // 返回 RuntimeTypeInfo 对象
                 required_params: 1,
             },
             "sizeof" => Type::Function {
-                param_types: vec![Type::Dynamic],
+                param_types: vec![Type::Unknown],  // 可接收任何类型
                 return_type: Box::new(Type::Int),
                 required_params: 1,
             },
@@ -658,18 +848,24 @@ impl TypeChecker {
                 self.env.leave_scope();
                 Ok(())
             }
-            Stmt::TryCatch { try_block, catch_param, catch_block, finally_block, span } => {
+            Stmt::TryCatch { try_block, catch_param, catch_type, catch_block, finally_block, span } => {
                 self.check_stmt(try_block)?;
                 
                 self.env.enter_scope();
-                if let Some(param_name) = catch_param {
-                    // 异常参数类型为 dynamic（或 Exception）
-                    self.env.define_variable(param_name.clone(), Type::Dynamic, false)
+                // 参考 C#：如果有参数，必须有类型（解析器已强制）
+                if let (Some(param_name), Some(type_name)) = (catch_param, catch_type) {
+                    // 检查异常类型是否存在
+                    if self.env.lookup_type(type_name).is_none() {
+                        return Err(TypeError::undefined_type(type_name.clone(), *span));
+                    }
+                    let param_type = Type::Class(type_name.clone());
+                    self.env.define_variable(param_name.clone(), param_type, false)
                         .map_err(|_| TypeError::new(
                             TypeErrorKind::DuplicateDefinition(param_name.clone()),
                             *span,
                         ))?;
                 }
+                // 无参 catch：不定义变量，无法访问异常对象
                 self.check_stmt(catch_block)?;
                 self.env.leave_scope();
                 
@@ -1088,7 +1284,7 @@ impl TypeChecker {
                 Ok(Type::Void)
             }
             
-            _ => Ok(Type::Dynamic),
+            _ => Ok(Type::Unknown),  // 未知表达式返回 unknown 类型
         }
     }
     
@@ -1434,7 +1630,7 @@ impl TypeChecker {
             .filter(|f| !f.is_static)
             .map(|f| (f.name.clone(), FieldInfo {
                 name: f.name.clone(),
-                ty: f.type_ann.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Dynamic),
+                ty: f.type_ann.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Unknown),  // 无类型注解默认为 unknown
                 is_mutable: !f.is_const,
                 visibility: match f.visibility {
                     crate::parser::ast::Visibility::Public => Visibility::Public,
@@ -1452,7 +1648,7 @@ impl TypeChecker {
             .filter(|f| f.is_static)
             .map(|f| (f.name.clone(), FieldInfo {
                 name: f.name.clone(),
-                ty: f.type_ann.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Dynamic),
+                ty: f.type_ann.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Unknown),  // 无类型注解默认为 unknown
                 is_mutable: !f.is_const,
                 visibility: match f.visibility {
                     crate::parser::ast::Visibility::Public => Visibility::Public,

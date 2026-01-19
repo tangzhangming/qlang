@@ -1093,7 +1093,7 @@ impl Compiler {
                 // 注册类型别名到符号表
                 self.type_aliases.insert(name.clone(), target_type.ty.clone());
             }
-            Stmt::TryCatch { try_block, catch_param, catch_block, finally_block, span } => {
+            Stmt::TryCatch { try_block, catch_param, catch_type: _, catch_block, finally_block, span } => {
                 // 记录 try 块开始时的槽位，用于确保 catch 参数位置正确
                 let try_start_slot = self.symbols.current_slot();
                 

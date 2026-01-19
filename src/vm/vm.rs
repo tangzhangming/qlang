@@ -3592,9 +3592,9 @@ impl VM {
                         return Err(self.runtime_error("Invalid class name"));
                     };
                     
-                    // 检查是否是标准库类
+                    // 检查是否是标准库类（支持简短名称和完整名称）
                     let registry = get_stdlib_registry();
-                    if let Some((_, _)) = registry.find_class_module(&class_name) {
+                    if let Some(full_class_name) = registry.resolve_class_name(&class_name) {
                         // 是标准库类，从栈中获取参数
                         let args_start = self.stack.len() - arg_count;
                         let args = self.stack[args_start..].to_vec();
@@ -3602,7 +3602,7 @@ impl VM {
                         self.stack.truncate(args_start);
                         
                         // 调用标准库构造函数
-                        match registry.create_class_instance(&class_name, &args) {
+                        match registry.create_class_instance(&full_class_name, &args) {
                             Ok(instance) => {
                                 self.push(instance);
                                 continue;

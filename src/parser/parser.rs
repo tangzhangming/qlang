@@ -3369,14 +3369,24 @@ impl Parser {
         }
         self.advance(); // 消费 'catch'
         
-        // 可选的参数名 (e)
-        let catch_param = if self.check(&TokenKind::LeftParen) {
+        // 可选的参数名和类型 (e:Exception)
+        // 参考 C#：如果有参数名，必须指定类型
+        let (catch_param, catch_type) = if self.check(&TokenKind::LeftParen) {
             self.advance(); // 消费 '('
             let param = self.expect_identifier()?;
+            
+            // 必须有类型注解
+            if !self.check(&TokenKind::Colon) {
+                let msg = format_message(messages::ERR_COMPILE_CATCH_MISSING_TYPE, self.locale, &[]);
+                return Err(ParseError::new(msg, self.current_span()));
+            }
+            self.advance(); // 消费 ':'
+            let type_name = self.expect_identifier()?;
+            
             self.expect(&TokenKind::RightParen)?;
-            Some(param)
+            (Some(param), Some(type_name))
         } else {
-            None
+            (None, None)
         };
         
         // 解析 catch 块
@@ -3396,6 +3406,7 @@ impl Parser {
         Ok(Stmt::TryCatch {
             try_block: Box::new(try_block),
             catch_param,
+            catch_type,
             catch_block: Box::new(catch_block),
             finally_block,
             span,
