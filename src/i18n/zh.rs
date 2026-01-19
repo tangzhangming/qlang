@@ -20,6 +20,7 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_BREAK_OUTSIDE_LOOP => "'break' 只能在循环内使用",
         ERR_COMPILE_CONTINUE_OUTSIDE_LOOP => "'continue' 只能在循环内使用",
         ERR_COMPILE_UNKNOWN_FUNCTION => "未知的函数: '{}'",
+        ERR_COMPILE_CONSTRUCTOR_OVERLOAD => "不允许构造函数重载：只能定义一个 'init' 方法",
         
         // 类型检查错误
         ERR_TYPE_UNDEFINED_TYPE => "未定义的类型: '{}'",

@@ -21,6 +21,17 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use config::{LANG_NAME, VERSION, SOURCE_EXTENSION, PROJECT_FILE};
+
+/// 清理路径显示格式（移除 Windows 的 \\?\ 前缀）
+fn display_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    // Windows canonicalize 返回 \\?\C:\... 格式，需要清理
+    if s.starts_with(r"\\?\") {
+        s[4..].to_string()
+    } else {
+        s.to_string()
+    }
+}
 use i18n::{Locale, format_message, messages};
 use lexer::Scanner;
 use parser::{Parser, Program, Stmt};
@@ -240,11 +251,11 @@ fn load_source_file(
     
     // 读取文件
     let source = fs::read_to_string(path)
-        .map_err(|e| format!("无法读取文件 {:?}: {}", path, e))?;
+        .map_err(|e| format!("无法读取文件 {}: {}", display_path(path), e))?;
     
     // 解析
     let program = parse_source(&source, locale)
-        .map_err(|e| format!("解析 {:?} 失败:\n{}", path, e))?;
+        .map_err(|e| format!("解析 {} 失败:\n{}", display_path(path), e))?;
     
     // 递归加载依赖
     for import in &program.imports {

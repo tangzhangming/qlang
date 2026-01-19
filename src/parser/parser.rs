@@ -1244,7 +1244,7 @@ impl Parser {
         // 检查是否有多个构造函数（禁止构造函数重载）
         let init_methods: Vec<_> = methods.iter().filter(|m| m.name == "init").collect();
         if init_methods.len() > 1 {
-            let msg = "Constructor overloading is not allowed. Only one 'init' method is permitted".to_string();
+            let msg = format_message(messages::ERR_COMPILE_CONSTRUCTOR_OVERLOAD, self.locale, &[]);
             return Err(ParseError::new(msg, init_methods[1].span));
         }
         
