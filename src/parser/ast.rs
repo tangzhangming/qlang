@@ -109,8 +109,21 @@ pub struct TypeAnnotation {
 pub struct TypeParam {
     /// 参数名（如 T）
     pub name: String,
-    /// 约束（如 T: Comparable，暂未实现）
-    pub bounds: Vec<String>,
+    /// 类型约束（如 T: Comparable<T> + Printable）
+    pub bounds: Vec<crate::types::TypeBound>,
+    /// 默认类型（可选）
+    pub default_type: Option<TypeAnnotation>,
+    /// 位置信息
+    pub span: Span,
+}
+
+/// Where 子句约束项（如 where T: Comparable<T>, U: Printable）
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhereClause {
+    /// 被约束的类型参数名
+    pub type_param: String,
+    /// 约束列表
+    pub bounds: Vec<crate::types::TypeBound>,
     /// 位置信息
     pub span: Span,
 }
@@ -494,6 +507,8 @@ pub enum Stmt {
         name: String,
         /// 泛型类型参数（如 struct Pair<K, V>）
         type_params: Vec<TypeParam>,
+        /// where 子句约束
+        where_clauses: Vec<WhereClause>,
         /// 实现的接口列表
         interfaces: Vec<String>,
         fields: Vec<StructField>,
@@ -505,6 +520,8 @@ pub enum Stmt {
         name: String,
         /// 泛型类型参数（如 class List<T>）
         type_params: Vec<TypeParam>,
+        /// where 子句约束
+        where_clauses: Vec<WhereClause>,
         /// 是否是抽象类
         is_abstract: bool,
         parent: Option<String>,
@@ -518,6 +535,10 @@ pub enum Stmt {
     /// interface 定义
     InterfaceDef {
         name: String,
+        /// 泛型类型参数
+        type_params: Vec<TypeParam>,
+        /// 父接口
+        super_interfaces: Vec<String>,
         methods: Vec<InterfaceMethod>,
         span: Span,
     },
@@ -526,6 +547,10 @@ pub enum Stmt {
         name: String,
         /// 泛型类型参数（如 trait Comparable<T>）
         type_params: Vec<TypeParam>,
+        /// where 子句约束
+        where_clauses: Vec<WhereClause>,
+        /// 父 trait
+        super_traits: Vec<crate::types::TypeBound>,
         methods: Vec<TraitMethod>,
         span: Span,
     },
@@ -559,6 +584,8 @@ pub enum Stmt {
         name: String,
         /// 泛型类型参数（如 func map<T, U>(...)）
         type_params: Vec<TypeParam>,
+        /// where 子句约束
+        where_clauses: Vec<WhereClause>,
         params: Vec<FnParam>,
         return_type: Option<TypeAnnotation>,
         body: Box<Stmt>,

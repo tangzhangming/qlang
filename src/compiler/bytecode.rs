@@ -71,6 +71,12 @@ pub enum OpCode {
     GetLocal = 50,
     /// 设置局部变量: 操作数为槽位索引 (u16)
     SetLocal = 51,
+    /// 获取 Upvalue（闭包捕获的变量）: 操作数为 upvalue 索引 (u16)
+    GetUpvalue = 52,
+    /// 设置 Upvalue: 操作数为 upvalue 索引 (u16)
+    SetUpvalue = 53,
+    /// 关闭 Upvalue（将栈上的值移到堆上）: 操作数为槽位索引 (u16)
+    CloseUpvalue = 54,
     
     // ============ 控制流 ============
     /// 无条件跳转: 操作数为偏移量 (i16)
@@ -167,6 +173,12 @@ pub enum OpCode {
     /// 非空断言获取字段（如果对象为 null 则 panic）
     /// 操作数: 字段名称索引 (u16)
     NonNullGetField = 104,
+    /// 安全调用方法（如果对象为 null 则返回 null，不调用）
+    /// 操作数: 方法名索引 (u16), 参数数量 (u8)
+    SafeInvokeMethod = 105,
+    /// 非空断言调用方法（如果对象为 null 则 panic）
+    /// 操作数: 方法名索引 (u16), 参数数量 (u8)
+    NonNullInvokeMethod = 106,
     
     // ============ 函数调用 ============
     /// 创建闭包
@@ -336,6 +348,9 @@ impl From<u8> for OpCode {
             36 => OpCode::Shr,
             50 => OpCode::GetLocal,
             51 => OpCode::SetLocal,
+            52 => OpCode::GetUpvalue,
+            53 => OpCode::SetUpvalue,
+            54 => OpCode::CloseUpvalue,
             60 => OpCode::Jump,
             61 => OpCode::JumpIfFalse,
             62 => OpCode::JumpIfTrue,
@@ -365,6 +380,8 @@ impl From<u8> for OpCode {
             102 => OpCode::JumpIfNull,
             103 => OpCode::SafeGetField,
             104 => OpCode::NonNullGetField,
+            105 => OpCode::SafeInvokeMethod,
+            106 => OpCode::NonNullInvokeMethod,
             80 => OpCode::Closure,
             81 => OpCode::Call,
             82 => OpCode::Return,

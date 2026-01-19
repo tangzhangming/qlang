@@ -25,6 +25,14 @@ impl CompileError {
     }
 }
 
+/// 尾调用信息（用于尾调用优化）
+struct TailCallInfo {
+    /// 被调用的函数表达式
+    callee: Expr,
+    /// 调用参数
+    args: Vec<Expr>,
+}
+
 /// 字节码编译器
 /// 循环信息（用于 break/continue）
 struct LoopInfo {
@@ -562,16 +570,31 @@ impl Compiler {
                 }
             }
             Stmt::Return { value, span } => {
-                // 编译返回值
+                // 尾调用优化：如果返回值是函数调用，使用 TailCall 指令
                 if let Some(expr) = value {
-                    self.compile_expr(expr);
+                    if let Some(tail_call_info) = self.try_extract_tail_call(expr) {
+                        // 这是一个尾调用，使用 TailCall 指令
+                        // 1. 编译函数表达式
+                        self.compile_expr(&tail_call_info.callee);
+                        
+                        // 2. 编译参数
+                        for arg in &tail_call_info.args {
+                            self.compile_expr(arg);
+                        }
+                        
+                        // 3. 写入 TailCall 指令
+                        self.chunk.write_op(OpCode::TailCall, span.line);
+                        self.chunk.write(tail_call_info.args.len() as u8, span.line);
+                    } else {
+                        // 普通返回
+                        self.compile_expr(expr);
+                        self.chunk.write_op(OpCode::Return, span.line);
+                    }
                 } else {
                     // 无返回值时返回 null
                     self.chunk.write_constant(Value::null(), span.line);
+                    self.chunk.write_op(OpCode::Return, span.line);
                 }
-                
-                // 写入 Return 指令
-                self.chunk.write_op(OpCode::Return, span.line);
             }
             Stmt::Match { expr, arms, span } => {
                 use crate::parser::ast::MatchPattern;
@@ -723,7 +746,7 @@ impl Compiler {
                     self.chunk.write_op(OpCode::Pop, span.line);
                 }
             }
-            Stmt::StructDef { name, type_params: _, interfaces, fields: _, methods, span } => {
+            Stmt::StructDef { name, type_params: _, where_clauses: _, interfaces, fields: _, methods, span } => {
                 // 注册 struct 类型
                 self.chunk.register_type(name.clone());
                 
@@ -756,7 +779,7 @@ impl Compiler {
                     self.compile_struct_method(name, method, *span);
                 }
             }
-            Stmt::ClassDef { name, type_params: _, is_abstract, parent, interfaces, traits, fields, methods, span } => {
+            Stmt::ClassDef { name, type_params: _, where_clauses: _, is_abstract, parent, interfaces, traits, fields, methods, span } => {
                 // 注册 class 类型（包括是否抽象）
                 self.chunk.register_class_with_abstract(name.clone(), parent.clone(), *is_abstract);
                 
@@ -834,6 +857,7 @@ impl Compiler {
                                 has_variadic: false,
                                 chunk_index: value_start,
                                 local_count: 0,
+                                upvalues: Vec::new(),
                             };
                             let func_index = self.chunk.add_constant(Value::function(Arc::new(init_func)));
                             // 使用不同的注册方法取决于是否是常量
@@ -868,7 +892,7 @@ impl Compiler {
                     self.compile_class_method(name, method, parent.as_deref(), *span);
                 }
             }
-            Stmt::InterfaceDef { name, methods, span: _ } => {
+            Stmt::InterfaceDef { name, type_params: _, super_interfaces: _, methods, span: _ } => {
                 // 收集接口的方法签名
                 let method_infos: Vec<_> = methods.iter().map(|m| {
                     crate::compiler::bytecode::InterfaceMethodInfo {
@@ -880,7 +904,7 @@ impl Compiler {
                 // 注册 interface
                 self.chunk.register_interface(name.clone(), method_infos);
             }
-            Stmt::TraitDef { name, type_params: _, methods, span: _ } => {
+            Stmt::TraitDef { name, type_params: _, where_clauses: _, super_traits: _, methods, span: _ } => {
                 // 收集 trait 的方法信息
                 let mut method_infos = Vec::new();
                 
@@ -933,6 +957,7 @@ impl Compiler {
                             has_variadic: false,
                             chunk_index: func_start,
                             local_count,
+                            upvalues: Vec::new(),
                         };
                         
                         Some(self.chunk.add_constant(Value::function(Arc::new(func))))
@@ -1053,7 +1078,7 @@ impl Compiler {
                 // 生成 Throw 操作码
                 self.chunk.write_op(OpCode::Throw, span.line);
             }
-            Stmt::FnDef { name, type_params: _, params, return_type: _, body, visibility: _, span } => {
+            Stmt::FnDef { name, type_params: _, where_clauses: _, params, return_type: _, body, visibility: _, span } => {
                 // 编译命名函数定义（支持递归）
                 // 策略：先在常量池中预留位置并注册函数名，然后编译函数体
                 
@@ -1157,6 +1182,7 @@ impl Compiler {
                     has_variadic,
                     chunk_index: func_start,
                     local_count,
+                    upvalues: Vec::new(),
                 };
                 self.chunk.constants[func_index as usize] = Value::function(Arc::new(func));
                 
@@ -1302,6 +1328,7 @@ impl Compiler {
             has_variadic,
             chunk_index: func_start,
             local_count,
+            upvalues: Vec::new(),
         };
         
         // 12. 添加到常量池并注册方法
@@ -1484,6 +1511,7 @@ impl Compiler {
             has_variadic,
             chunk_index: func_start,
             local_count,
+            upvalues: Vec::new(),
         };
         
         // 12. 添加到常量池并注册方法（静态或实例）
@@ -1944,6 +1972,60 @@ impl Compiler {
                     return;
                 }
                 
+                // 检查是否是安全方法调用 (obj?.method(args))
+                if let Expr::SafeMember { object, member, span: member_span } = callee.as_ref() {
+                    // 编译对象表达式
+                    self.compile_expr(object);
+                    
+                    // 编译所有参数
+                    for arg in args {
+                        self.compile_expr(arg);
+                    }
+                    
+                    // 检查参数数量
+                    if args.len() > u8::MAX as usize {
+                        let msg = "Too many arguments".to_string();
+                        self.errors.push(CompileError::new(msg, *span));
+                        return;
+                    }
+                    
+                    // 将方法名添加到常量池
+                    let method_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                    
+                    // 生成 SafeInvokeMethod 指令（如果对象为 null 则返回 null）
+                    self.chunk.write_op(OpCode::SafeInvokeMethod, member_span.line);
+                    self.chunk.write_u16(method_name_index, member_span.line);
+                    self.chunk.write(args.len() as u8, member_span.line);
+                    return;
+                }
+                
+                // 检查是否是非空断言方法调用 (obj!.method(args))
+                if let Expr::NonNullMember { object, member, span: member_span } = callee.as_ref() {
+                    // 编译对象表达式
+                    self.compile_expr(object);
+                    
+                    // 编译所有参数
+                    for arg in args {
+                        self.compile_expr(arg);
+                    }
+                    
+                    // 检查参数数量
+                    if args.len() > u8::MAX as usize {
+                        let msg = "Too many arguments".to_string();
+                        self.errors.push(CompileError::new(msg, *span));
+                        return;
+                    }
+                    
+                    // 将方法名添加到常量池
+                    let method_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                    
+                    // 生成 NonNullInvokeMethod 指令（如果对象为 null 则 panic）
+                    self.chunk.write_op(OpCode::NonNullInvokeMethod, member_span.line);
+                    self.chunk.write_u16(method_name_index, member_span.line);
+                    self.chunk.write(args.len() as u8, member_span.line);
+                    return;
+                }
+                
                 // 用户定义函数调用
                 // 1. 编译被调用的表达式（将函数值压栈）
                 self.compile_expr(callee);
@@ -2266,6 +2348,7 @@ impl Compiler {
                     has_variadic,
                     chunk_index: func_start,
                     local_count,
+                    upvalues: Vec::new(), // TODO: 实际填充捕获的 upvalues
                 };
                 self.chunk.write_constant(Value::function(Arc::new(func)), span.line);
             }
@@ -2489,6 +2572,36 @@ impl Compiler {
                     self.errors.push(CompileError::new(msg, *span));
                 }
             }
+        }
+    }
+    
+    /// 尝试提取尾调用信息
+    /// 如果表达式是一个简单的函数调用（不是方法调用），返回调用信息
+    fn try_extract_tail_call(&self, expr: &Expr) -> Option<TailCallInfo> {
+        match expr {
+            Expr::Call { callee, args, .. } => {
+                // 检查是否是简单的标识符调用（用户自定义函数）
+                // 排除内置函数和方法调用
+                match callee.as_ref() {
+                    Expr::Identifier { name, .. } => {
+                        // 排除内置函数
+                        match name.as_str() {
+                            "print" | "println" | "typeof" | "sizeof" | "panic" | "time" => None,
+                            _ => Some(TailCallInfo {
+                                callee: callee.as_ref().clone(),
+                                args: args.clone(),
+                            })
+                        }
+                    }
+                    // 对于更复杂的 callee（如闭包表达式），也可以进行尾调用优化
+                    Expr::Closure { .. } => Some(TailCallInfo {
+                        callee: callee.as_ref().clone(),
+                        args: args.clone(),
+                    }),
+                    _ => None, // 其他情况（方法调用、静态成员调用等）暂不优化
+                }
+            }
+            _ => None,
         }
     }
     

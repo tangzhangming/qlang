@@ -752,7 +752,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::StructDef { name, type_params, interfaces, fields, methods, span })
+        Ok(Stmt::StructDef { name, type_params, where_clauses: Vec::new(), interfaces, fields, methods, span })
     }
     
     /// 解析可见性修饰符（Kotlin 风格，默认为 public）
@@ -777,9 +777,10 @@ impl Parser {
         }
     }
     
-    /// 解析泛型类型参数列表 <T, K, V>
+    /// 解析泛型类型参数列表 <T, K: Comparable<K>, V = string>
     fn parse_type_params(&mut self) -> Result<Vec<super::ast::TypeParam>, ParseError> {
         use super::ast::TypeParam;
+        use crate::types::TypeBound;
         
         let mut params = Vec::new();
         
@@ -797,17 +798,8 @@ impl Parser {
         
         // 解析第一个类型参数
         if !self.check(&TokenKind::Greater) {
-            let param_span = self.current_span();
-            let param_name = self.expect_identifier()?;
-            
-            // TODO: 解析约束 (如 T: Comparable)
-            let bounds = Vec::new();
-            
-            params.push(TypeParam {
-                name: param_name,
-                bounds,
-                span: param_span,
-            });
+            let param = self.parse_single_type_param()?;
+            params.push(param);
             
             // 解析更多参数
             while self.check(&TokenKind::Comma) {
@@ -822,14 +814,8 @@ impl Parser {
                     break; // 允许末尾逗号
                 }
                 
-                let param_span = self.current_span();
-                let param_name = self.expect_identifier()?;
-                
-                params.push(TypeParam {
-                    name: param_name,
-                    bounds: Vec::new(),
-                    span: param_span,
-                });
+                let param = self.parse_single_type_param()?;
+                params.push(param);
             }
         }
         
@@ -837,6 +823,141 @@ impl Parser {
         self.expect(&TokenKind::Greater)?;
         
         Ok(params)
+    }
+    
+    /// 解析单个类型参数（支持约束和默认类型）
+    /// 格式: T, T: Bound, T: Bound1 + Bound2, T = DefaultType
+    fn parse_single_type_param(&mut self) -> Result<super::ast::TypeParam, ParseError> {
+        use crate::types::TypeBound;
+        
+        let param_span = self.current_span();
+        let param_name = self.expect_identifier()?;
+        
+        // 解析约束 T: Bound1 + Bound2
+        let bounds = if self.check(&TokenKind::Colon) {
+            self.advance();
+            self.parse_type_bounds()?
+        } else {
+            Vec::new()
+        };
+        
+        // 解析默认类型 T = DefaultType
+        let default_type = if self.check(&TokenKind::Equal) {
+            self.advance();
+            Some(self.parse_type_annotation()?)
+        } else {
+            None
+        };
+        
+        Ok(super::ast::TypeParam {
+            name: param_name,
+            bounds,
+            default_type,
+            span: param_span,
+        })
+    }
+    
+    /// 解析类型约束列表（用 + 连接）
+    /// 格式: Comparable<T> + Printable + Clone
+    fn parse_type_bounds(&mut self) -> Result<Vec<crate::types::TypeBound>, ParseError> {
+        use crate::types::TypeBound;
+        
+        let mut bounds = Vec::new();
+        
+        // 解析第一个约束
+        bounds.push(self.parse_single_type_bound()?);
+        
+        // 解析更多约束（用 + 连接）
+        while self.check(&TokenKind::Plus) {
+            self.advance();
+            bounds.push(self.parse_single_type_bound()?);
+        }
+        
+        Ok(bounds)
+    }
+    
+    /// 解析单个类型约束
+    /// 格式: Comparable 或 Comparable<T>
+    fn parse_single_type_bound(&mut self) -> Result<crate::types::TypeBound, ParseError> {
+        use crate::types::TypeBound;
+        
+        let trait_name = self.expect_identifier()?;
+        
+        // 检查是否有泛型参数
+        let type_args = if self.check(&TokenKind::Less) {
+            self.advance(); // 消费 '<'
+            let args = self.parse_type_args()?;
+            self.expect(&TokenKind::Greater)?;
+            args
+        } else {
+            Vec::new()
+        };
+        
+        Ok(TypeBound {
+            trait_name,
+            type_args,
+        })
+    }
+    
+    /// 解析 where 子句
+    /// 格式: where T: Comparable<T>, U: Printable
+    fn parse_where_clauses(&mut self) -> Result<Vec<super::ast::WhereClause>, ParseError> {
+        use super::ast::WhereClause;
+        
+        let mut clauses = Vec::new();
+        
+        // 检查是否有 'where' 关键字
+        if !self.check(&TokenKind::Where) {
+            return Ok(clauses);
+        }
+        
+        self.advance(); // 消费 'where'
+        
+        // 跳过空行
+        while self.check(&TokenKind::Newline) {
+            self.advance();
+        }
+        
+        // 解析第一个约束
+        let clause = self.parse_single_where_clause()?;
+        clauses.push(clause);
+        
+        // 解析更多约束（用逗号分隔）
+        while self.check(&TokenKind::Comma) {
+            self.advance();
+            
+            // 跳过空行
+            while self.check(&TokenKind::Newline) {
+                self.advance();
+            }
+            
+            // 检查是否是新语句开始（{ 或其他）
+            if self.check(&TokenKind::LeftBrace) || self.check(&TokenKind::LeftParen) {
+                break;
+            }
+            
+            let clause = self.parse_single_where_clause()?;
+            clauses.push(clause);
+        }
+        
+        Ok(clauses)
+    }
+    
+    /// 解析单个 where 子句约束
+    /// 格式: T: Comparable<T> + Printable
+    fn parse_single_where_clause(&mut self) -> Result<super::ast::WhereClause, ParseError> {
+        let span = self.current_span();
+        let type_param = self.expect_identifier()?;
+        
+        self.expect(&TokenKind::Colon)?;
+        
+        let bounds = self.parse_type_bounds()?;
+        
+        Ok(super::ast::WhereClause {
+            type_param,
+            bounds,
+            span,
+        })
     }
     
     /// 解析 struct 字段
@@ -1019,7 +1140,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::ClassDef { name, type_params, is_abstract, parent, interfaces, traits, fields, methods, span })
+        Ok(Stmt::ClassDef { name, type_params, where_clauses: Vec::new(), is_abstract, parent, interfaces, traits, fields, methods, span })
     }
     
     /// 解析 class 字段
@@ -1147,7 +1268,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::InterfaceDef { name, methods, span })
+        Ok(Stmt::InterfaceDef { name, type_params: Vec::new(), super_interfaces: Vec::new(), methods, span })
     }
     
     /// 解析 interface 方法签名
@@ -1225,7 +1346,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::TraitDef { name, type_params, methods, span })
+        Ok(Stmt::TraitDef { name, type_params, where_clauses: Vec::new(), super_traits: Vec::new(), methods, span })
     }
     
     /// 解析 trait 方法（可能有默认实现）
@@ -1619,6 +1740,7 @@ impl Parser {
     fn parse_type(&mut self) -> Result<Type, ParseError> {
         let token = self.advance();
         
+        // 解析基础类型
         let base_type = match &token.kind {
             TokenKind::Int => Type::Int,
             TokenKind::Uint => Type::Uint,
@@ -1638,6 +1760,10 @@ impl Parser {
             TokenKind::StringType => Type::String,
             TokenKind::Unknown => Type::Unknown,
             TokenKind::Dynamic => Type::Dynamic,
+            TokenKind::Func => {
+                // 函数类型: func(int, string) bool
+                return self.parse_function_type();
+            }
             TokenKind::Identifier(name) => Type::Class(name.clone()),
             _ => {
                 let msg = format_message(
@@ -1649,6 +1775,20 @@ impl Parser {
             }
         };
         
+        // 检查泛型类型参数 <T, U>
+        let typed = if self.check(&TokenKind::Less) {
+            self.advance(); // 消费 '<'
+            let type_args = self.parse_type_args()?;
+            self.expect(&TokenKind::Greater)?;
+            
+            Type::Generic {
+                base_type: Box::new(base_type),
+                type_args,
+            }
+        } else {
+            base_type
+        };
+        
         // 检查是否是固定数组类型 int[10] 或动态切片 int[]
         let result_type = if self.check(&TokenKind::LeftBracket) {
             self.advance(); // 消费 '['
@@ -1656,7 +1796,7 @@ impl Parser {
             if self.check(&TokenKind::RightBracket) {
                 // int[] - 动态切片
                 self.advance(); // 消费 ']'
-                Type::Slice { element_type: Box::new(base_type) }
+                Type::Slice { element_type: Box::new(typed) }
             } else {
                 // int[10] - 固定数组
                 let size = match &self.current_token().kind {
@@ -1678,10 +1818,10 @@ impl Parser {
                 };
                 self.advance(); // 消费数字
                 self.expect(&TokenKind::RightBracket)?;
-                Type::Array { element_type: Box::new(base_type), size }
+                Type::Array { element_type: Box::new(typed), size }
             }
         } else {
-            base_type
+            typed
         };
         
         // 检查是否是可空类型
@@ -1691,6 +1831,91 @@ impl Parser {
         } else {
             Ok(result_type)
         }
+    }
+    
+    /// 解析泛型类型参数列表（如 <int, string>）
+    fn parse_type_args(&mut self) -> Result<Vec<Type>, ParseError> {
+        let mut types = Vec::new();
+        
+        // 跳过空行
+        while self.check(&TokenKind::Newline) {
+            self.advance();
+        }
+        
+        // 检查空参数列表
+        if self.check(&TokenKind::Greater) {
+            return Ok(types);
+        }
+        
+        // 解析第一个类型
+        types.push(self.parse_type()?);
+        
+        // 解析更多类型
+        while self.check(&TokenKind::Comma) {
+            self.advance();
+            
+            // 跳过空行
+            while self.check(&TokenKind::Newline) {
+                self.advance();
+            }
+            
+            if self.check(&TokenKind::Greater) {
+                break; // 允许末尾逗号
+            }
+            
+            types.push(self.parse_type()?);
+        }
+        
+        Ok(types)
+    }
+    
+    /// 解析函数类型 func(int, string) bool
+    fn parse_function_type(&mut self) -> Result<Type, ParseError> {
+        // 期望 '('
+        self.expect(&TokenKind::LeftParen)?;
+        
+        let mut param_types = Vec::new();
+        
+        // 解析参数类型
+        if !self.check(&TokenKind::RightParen) {
+            param_types.push(self.parse_type()?);
+            
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+                param_types.push(self.parse_type()?);
+            }
+        }
+        
+        self.expect(&TokenKind::RightParen)?;
+        
+        // 解析返回类型（可选）
+        let return_type = if self.check_type_start() {
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+        
+        Ok(Type::Function {
+            param_types,
+            return_type: Box::new(return_type),
+        })
+    }
+    
+    /// 检查当前是否是类型开始
+    fn check_type_start(&self) -> bool {
+        matches!(
+            self.current_token().kind,
+            TokenKind::Int | TokenKind::Uint |
+            TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::I64 |
+            TokenKind::U8 | TokenKind::U16 | TokenKind::U32 | TokenKind::U64 |
+            TokenKind::F32 | TokenKind::F64 |
+            TokenKind::Bool | TokenKind::Byte | TokenKind::CharType | TokenKind::StringType |
+            TokenKind::Unknown | TokenKind::Dynamic | TokenKind::Func |
+            TokenKind::Identifier(_)
+        )
     }
     
     /// 期望一个标识符
@@ -2522,7 +2747,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::FnDef { name, type_params, params, return_type, body, visibility, span })
+        Ok(Stmt::FnDef { name, type_params, where_clauses: Vec::new(), params, return_type, body, visibility, span })
     }
     
     /// 解析闭包表达式

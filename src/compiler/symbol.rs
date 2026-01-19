@@ -1,6 +1,6 @@
 //! Symbol Table
 //!
-//! Manages variables and scopes
+//! Manages variables, scopes, and closure captures (upvalues)
 
 #![allow(dead_code)]
 
@@ -19,6 +19,8 @@ pub struct Symbol {
     pub slot: usize,
     /// Scope depth
     pub depth: usize,
+    /// 是否被闭包捕获
+    pub is_captured: bool,
 }
 
 impl Symbol {
@@ -30,11 +32,70 @@ impl Symbol {
             is_const,
             slot,
             depth,
+            is_captured: false,
         }
     }
 }
 
-/// Symbol table (supports nested scopes)
+/// Upvalue 描述符（闭包捕获的外部变量）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Upvalue {
+    /// 在父函数中的索引
+    pub index: u16,
+    /// true: 捕获的是父函数的局部变量; false: 捕获的是父函数的 upvalue
+    pub is_local: bool,
+}
+
+impl Upvalue {
+    /// 创建一个捕获局部变量的 upvalue
+    pub fn local(index: u16) -> Self {
+        Self { index, is_local: true }
+    }
+    
+    /// 创建一个捕获 upvalue 的 upvalue
+    pub fn upvalue(index: u16) -> Self {
+        Self { index, is_local: false }
+    }
+}
+
+/// 编译器的闭包上下文
+#[derive(Debug, Clone, Default)]
+pub struct ClosureContext {
+    /// 当前闭包的 upvalues
+    pub upvalues: Vec<Upvalue>,
+    /// 父上下文
+    pub parent: Option<Box<ClosureContext>>,
+}
+
+impl ClosureContext {
+    /// 创建新的闭包上下文
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// 创建带父上下文的闭包上下文
+    pub fn with_parent(parent: ClosureContext) -> Self {
+        Self {
+            upvalues: Vec::new(),
+            parent: Some(Box::new(parent)),
+        }
+    }
+    
+    /// 添加 upvalue，返回索引
+    pub fn add_upvalue(&mut self, upvalue: Upvalue) -> u16 {
+        // 检查是否已存在相同的 upvalue
+        for (i, uv) in self.upvalues.iter().enumerate() {
+            if uv == &upvalue {
+                return i as u16;
+            }
+        }
+        let index = self.upvalues.len() as u16;
+        self.upvalues.push(upvalue);
+        index
+    }
+}
+
+/// Symbol table (supports nested scopes and closure captures)
 #[derive(Debug, Clone, Default)]
 pub struct SymbolTable {
     /// All symbols
@@ -43,6 +104,8 @@ pub struct SymbolTable {
     scope_depth: usize,
     /// Current slot (for allocating local variables)
     current_slot: usize,
+    /// 当前闭包上下文栈
+    closure_contexts: Vec<ClosureContext>,
 }
 
 impl SymbolTable {
@@ -165,6 +228,110 @@ impl SymbolTable {
     pub fn scope_depth(&self) -> usize {
         self.scope_depth
     }
+    
+    // ============ 闭包捕获支持 ============
+    
+    /// 进入闭包编译上下文
+    pub fn begin_closure(&mut self) {
+        let parent = if self.closure_contexts.is_empty() {
+            ClosureContext::new()
+        } else {
+            let current = self.closure_contexts.pop().unwrap();
+            ClosureContext::with_parent(current)
+        };
+        self.closure_contexts.push(parent);
+    }
+    
+    /// 退出闭包编译上下文，返回 upvalues
+    pub fn end_closure(&mut self) -> Vec<Upvalue> {
+        if let Some(ctx) = self.closure_contexts.pop() {
+            // 恢复父上下文
+            if let Some(parent) = ctx.parent {
+                self.closure_contexts.push(*parent);
+            }
+            ctx.upvalues
+        } else {
+            Vec::new()
+        }
+    }
+    
+    /// 解析变量，支持 upvalue 查找
+    /// 返回: (Option<slot>, Option<upvalue_index>, is_upvalue)
+    pub fn resolve_with_capture(&mut self, name: &str) -> VariableResolution {
+        // 首先在当前作用域查找
+        for symbol in self.symbols.iter().rev() {
+            if symbol.name == name {
+                return VariableResolution::Local(symbol.slot);
+            }
+        }
+        
+        // 如果在闭包上下文中，尝试解析为 upvalue
+        if !self.closure_contexts.is_empty() {
+            if let Some(upvalue_idx) = self.resolve_upvalue(name) {
+                return VariableResolution::Upvalue(upvalue_idx);
+            }
+        }
+        
+        VariableResolution::NotFound
+    }
+    
+    /// 递归解析 upvalue
+    fn resolve_upvalue(&mut self, name: &str) -> Option<u16> {
+        if self.closure_contexts.is_empty() {
+            return None;
+        }
+        
+        // 在父函数的局部变量中查找
+        for (i, symbol) in self.symbols.iter_mut().enumerate().rev() {
+            if symbol.name == name {
+                // 标记为被捕获
+                symbol.is_captured = true;
+                
+                // 添加 upvalue
+                if let Some(ctx) = self.closure_contexts.last_mut() {
+                    let upvalue = Upvalue::local(symbol.slot as u16);
+                    return Some(ctx.add_upvalue(upvalue));
+                }
+            }
+        }
+        
+        // 在父函数的 upvalues 中查找（嵌套闭包）
+        // 这里简化处理，实际实现可能需要更复杂的递归
+        None
+    }
+    
+    /// 标记符号为被捕获
+    pub fn mark_captured(&mut self, name: &str) {
+        for symbol in self.symbols.iter_mut().rev() {
+            if symbol.name == name {
+                symbol.is_captured = true;
+                break;
+            }
+        }
+    }
+    
+    /// 检查符号是否被捕获
+    pub fn is_captured(&self, name: &str) -> bool {
+        self.resolve(name).map(|s| s.is_captured).unwrap_or(false)
+    }
+    
+    /// 获取当前闭包上下文的 upvalues
+    pub fn current_upvalues(&self) -> &[Upvalue] {
+        self.closure_contexts.last()
+            .map(|ctx| ctx.upvalues.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+/// 变量解析结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableResolution {
+    /// 局部变量，包含槽位
+    Local(usize),
+    /// Upvalue，包含 upvalue 索引
+    Upvalue(u16),
+    /// 未找到
+    NotFound,
 }
 
 #[cfg(test)]

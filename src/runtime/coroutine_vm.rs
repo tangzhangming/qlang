@@ -107,6 +107,7 @@ impl CoroutineVM {
                     
                     // 压入参数
                     for arg in &g.args {
+                        let arg: &Value = arg;
                         self.vm.push_value(arg.clone());
                     }
                 }
@@ -169,6 +170,7 @@ impl CoroutineVM {
                     
                     // 压入参数
                     for arg in &g.args {
+                        let arg: &Value = arg;
                         self.vm.push_value(arg.clone());
                     }
                 }

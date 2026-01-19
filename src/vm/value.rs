@@ -131,6 +131,17 @@ pub struct Function {
     pub chunk_index: usize,
     /// 局部变量数量
     pub local_count: usize,
+    /// Upvalue 描述符（闭包捕获的变量）
+    pub upvalues: Vec<UpvalueDescriptor>,
+}
+
+/// Upvalue 描述符
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpvalueDescriptor {
+    /// 在父作用域中的索引
+    pub index: u16,
+    /// true: 捕获的是局部变量; false: 捕获的是 upvalue
+    pub is_local: bool,
 }
 
 impl PartialEq for Function {

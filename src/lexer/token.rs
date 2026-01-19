@@ -174,6 +174,8 @@ pub enum TokenKind {
     Map,
     /// with
     With,
+    /// where（泛型约束）
+    Where,
 
     // ============ 算术运算符 ============
     /// +
@@ -463,6 +465,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Panic => write!(f, "panic"),
             TokenKind::Map => write!(f, "map"),
             TokenKind::With => write!(f, "with"),
+            TokenKind::Where => write!(f, "where"),
             
             // 算术运算符
             TokenKind::Plus => write!(f, "+"),

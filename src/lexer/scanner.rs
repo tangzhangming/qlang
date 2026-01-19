@@ -266,12 +266,14 @@ impl Scanner {
             // 数字
             '0'..='9' => self.scan_number(),
             
-            // 标识符或关键字
-            // 标识符（支持字母、下划线、$ 开头）
-            'a'..='z' | 'A'..='Z' | '_' | '$' => self.scan_identifier(),
+            // 标识符或关键字（支持 Unicode）
+            c if Self::is_identifier_start(c) => self.scan_identifier(),
             
-            // 未知字符
-            _ => self.error_token(&format!("Unexpected character '{}'", c)),
+            // 未知字符 - 更好的错误恢复
+            _ => {
+                // 尝试跳过无效字符并继续
+                self.error_token(&format!("Unexpected character '{}' (U+{:04X})", c, c as u32))
+            }
         }
     }
 
@@ -426,11 +428,36 @@ impl Scanner {
         self.make_token(TokenKind::RawString(value))
     }
 
-    /// 扫描数字
+    /// 扫描数字（支持各种进制和数字分隔符）
     fn scan_number(&mut self) -> Token {
-        // 扫描整数部分
-        while !self.is_at_end() && self.peek().is_ascii_digit() {
+        // 检查进制前缀
+        let first_char = self.source[self.start];
+        
+        if first_char == '0' && !self.is_at_end() {
+            match self.peek() {
+                'x' | 'X' => return self.scan_hex_number(),
+                'b' | 'B' => return self.scan_binary_number(),
+                'o' | 'O' => return self.scan_octal_number(),
+                _ => {}
+            }
+        }
+        
+        // 扫描十进制整数部分（支持下划线分隔符）
+        while !self.is_at_end() && (self.peek().is_ascii_digit() || self.peek() == '_') {
+            if self.peek() == '_' {
+                // 下划线不能在数字开头或连续出现
+                let prev = self.source.get(self.current - 1).copied().unwrap_or('0');
+                if !prev.is_ascii_digit() {
+                    return self.error_token("Invalid number: underscore must be between digits");
+                }
+            }
             self.advance();
+        }
+        
+        // 检查下划线不能在数字末尾
+        let last = self.source.get(self.current - 1).copied().unwrap_or('0');
+        if last == '_' {
+            return self.error_token("Invalid number: underscore cannot be at the end");
         }
         
         // 检查是否有小数部分
@@ -438,8 +465,13 @@ impl Scanner {
             if let Some(next) = self.peek_next() {
                 if next.is_ascii_digit() {
                     self.advance(); // 消费 '.'
-                    while !self.is_at_end() && self.peek().is_ascii_digit() {
+                    while !self.is_at_end() && (self.peek().is_ascii_digit() || self.peek() == '_') {
                         self.advance();
+                    }
+                    // 检查下划线不能在小数末尾
+                    let last = self.source.get(self.current - 1).copied().unwrap_or('0');
+                    if last == '_' {
+                        return self.error_token("Invalid number: underscore cannot be at the end");
                     }
                     true
                 } else {
@@ -452,9 +484,30 @@ impl Scanner {
             false
         };
         
-        let lexeme: String = self.source[self.start..self.current].iter().collect();
+        // 检查科学计数法
+        let has_exponent = if self.peek() == 'e' || self.peek() == 'E' {
+            self.advance(); // 消费 'e' 或 'E'
+            if self.peek() == '+' || self.peek() == '-' {
+                self.advance();
+            }
+            if !self.peek().is_ascii_digit() {
+                return self.error_token("Invalid number: expected digit after exponent");
+            }
+            while !self.is_at_end() && (self.peek().is_ascii_digit() || self.peek() == '_') {
+                self.advance();
+            }
+            true
+        } else {
+            false
+        };
         
-        if is_float {
+        // 收集数字字符（移除下划线）
+        let lexeme: String = self.source[self.start..self.current]
+            .iter()
+            .filter(|&&c| c != '_')
+            .collect();
+        
+        if is_float || has_exponent {
             match lexeme.parse::<f64>() {
                 Ok(value) => self.make_token(TokenKind::Float(value)),
                 Err(_) => self.error_token(&format!("Invalid float: {}", lexeme)),
@@ -466,11 +519,118 @@ impl Scanner {
             }
         }
     }
+    
+    /// 扫描十六进制数字 (0x...)
+    fn scan_hex_number(&mut self) -> Token {
+        self.advance(); // 消费 'x' 或 'X'
+        
+        if !self.is_at_end() && !self.peek().is_ascii_hexdigit() {
+            return self.error_token("Invalid hexadecimal number: expected hex digit after 0x");
+        }
+        
+        while !self.is_at_end() && (self.peek().is_ascii_hexdigit() || self.peek() == '_') {
+            if self.peek() == '_' {
+                let prev = self.source.get(self.current - 1).copied().unwrap_or('0');
+                if !prev.is_ascii_hexdigit() {
+                    return self.error_token("Invalid number: underscore must be between digits");
+                }
+            }
+            self.advance();
+        }
+        
+        let last = self.source.get(self.current - 1).copied().unwrap_or('0');
+        if last == '_' {
+            return self.error_token("Invalid number: underscore cannot be at the end");
+        }
+        
+        // 移除 0x 前缀和下划线
+        let hex_str: String = self.source[self.start + 2..self.current]
+            .iter()
+            .filter(|&&c| c != '_')
+            .collect();
+        
+        match i64::from_str_radix(&hex_str, 16) {
+            Ok(value) => self.make_token(TokenKind::Integer(value)),
+            Err(_) => self.error_token(&format!("Invalid hexadecimal number: 0x{}", hex_str)),
+        }
+    }
+    
+    /// 扫描二进制数字 (0b...)
+    fn scan_binary_number(&mut self) -> Token {
+        self.advance(); // 消费 'b' 或 'B'
+        
+        if !self.is_at_end() && !matches!(self.peek(), '0' | '1') {
+            return self.error_token("Invalid binary number: expected 0 or 1 after 0b");
+        }
+        
+        while !self.is_at_end() && (matches!(self.peek(), '0' | '1') || self.peek() == '_') {
+            if self.peek() == '_' {
+                let prev = self.source.get(self.current - 1).copied().unwrap_or('0');
+                if !matches!(prev, '0' | '1') {
+                    return self.error_token("Invalid number: underscore must be between digits");
+                }
+            }
+            self.advance();
+        }
+        
+        let last = self.source.get(self.current - 1).copied().unwrap_or('0');
+        if last == '_' {
+            return self.error_token("Invalid number: underscore cannot be at the end");
+        }
+        
+        // 移除 0b 前缀和下划线
+        let bin_str: String = self.source[self.start + 2..self.current]
+            .iter()
+            .filter(|&&c| c != '_')
+            .collect();
+        
+        match i64::from_str_radix(&bin_str, 2) {
+            Ok(value) => self.make_token(TokenKind::Integer(value)),
+            Err(_) => self.error_token(&format!("Invalid binary number: 0b{}", bin_str)),
+        }
+    }
+    
+    /// 扫描八进制数字 (0o...)
+    fn scan_octal_number(&mut self) -> Token {
+        self.advance(); // 消费 'o' 或 'O'
+        
+        if !self.is_at_end() && !matches!(self.peek(), '0'..='7') {
+            return self.error_token("Invalid octal number: expected 0-7 after 0o");
+        }
+        
+        while !self.is_at_end() && (matches!(self.peek(), '0'..='7') || self.peek() == '_') {
+            if self.peek() == '_' {
+                let prev = self.source.get(self.current - 1).copied().unwrap_or('0');
+                if !matches!(prev, '0'..='7') {
+                    return self.error_token("Invalid number: underscore must be between digits");
+                }
+            }
+            self.advance();
+        }
+        
+        let last = self.source.get(self.current - 1).copied().unwrap_or('0');
+        if last == '_' {
+            return self.error_token("Invalid number: underscore cannot be at the end");
+        }
+        
+        // 移除 0o 前缀和下划线
+        let oct_str: String = self.source[self.start + 2..self.current]
+            .iter()
+            .filter(|&&c| c != '_')
+            .collect();
+        
+        match i64::from_str_radix(&oct_str, 8) {
+            Ok(value) => self.make_token(TokenKind::Integer(value)),
+            Err(_) => self.error_token(&format!("Invalid octal number: 0o{}", oct_str)),
+        }
+    }
 
-    /// 扫描标识符或关键字
+    /// 扫描标识符或关键字（支持 Unicode 标识符）
     fn scan_identifier(&mut self) -> Token {
-        // 支持 $ 开头的变量名（如 $name），但 $ 只能在开头
-        while !self.is_at_end() && (self.peek().is_alphanumeric() || self.peek() == '_') {
+        // 支持 Unicode 标识符：
+        // - 第一个字符：字母、下划线、$、或 Unicode XID_Start
+        // - 后续字符：字母数字、下划线、或 Unicode XID_Continue
+        while !self.is_at_end() && self.is_identifier_continue(self.peek()) {
             self.advance();
         }
         
@@ -478,6 +638,18 @@ impl Scanner {
         let kind = self.identifier_type(&lexeme);
         
         self.make_token(kind)
+    }
+    
+    /// 检查字符是否可以作为标识符开头
+    fn is_identifier_start(c: char) -> bool {
+        // 支持 ASCII 字母、下划线、$、以及 Unicode 字母
+        c.is_alphabetic() || c == '_' || c == '$'
+    }
+    
+    /// 检查字符是否可以作为标识符的后续字符
+    fn is_identifier_continue(&self, c: char) -> bool {
+        // 支持 ASCII 字母数字、下划线、以及 Unicode 字母和数字
+        c.is_alphanumeric() || c == '_'
     }
     
     /// 识别关键字或返回标识符
@@ -564,6 +736,7 @@ impl Scanner {
             "panic" => TokenKind::Panic,
             "map" => TokenKind::Map,
             "with" => TokenKind::With,
+            "where" => TokenKind::Where,
             
             // 通配符/下划线
             "_" => TokenKind::Underscore,

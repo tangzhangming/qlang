@@ -4,6 +4,8 @@
 
 pub mod value;
 pub mod vm;
+pub mod vtable;
 
 pub use value::Value;
 pub use vm::VM;
+pub use vtable::{VTable, VTableRegistry, TraitVTable, RuntimeTypeInfo};

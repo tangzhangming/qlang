@@ -15,17 +15,73 @@ const STACK_SIZE: usize = 256;
 /// 最大调用深度
 const MAX_FRAMES: usize = 64;
 
+/// 栈帧信息（用于栈追踪）
+#[derive(Debug, Clone)]
+pub struct StackFrame {
+    /// 函数名（闭包为 "<closure>"，顶层为 "<main>"）
+    pub function_name: String,
+    /// 源码文件名（如果有）
+    pub file_name: Option<String>,
+    /// 行号
+    pub line: usize,
+    /// 列号（如果有）
+    pub column: Option<usize>,
+}
+
+impl std::fmt::Display for StackFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let file = self.file_name.as_deref().unwrap_or("<unknown>");
+        if let Some(col) = self.column {
+            write!(f, "  at {} ({}:{}:{})", self.function_name, file, self.line, col)
+        } else {
+            write!(f, "  at {} ({}:{})", self.function_name, file, self.line)
+        }
+    }
+}
+
 /// 运行时错误
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
+    /// 错误消息
     pub message: String,
+    /// 发生错误的行号
     pub line: usize,
+    /// 栈追踪
+    pub stack_trace: Vec<StackFrame>,
 }
 
 impl RuntimeError {
     /// 创建新的运行时错误
     pub fn new(message: String, line: usize) -> Self {
-        Self { message, line }
+        Self { 
+            message, 
+            line,
+            stack_trace: Vec::new(),
+        }
+    }
+    
+    /// 创建带栈追踪的运行时错误
+    pub fn with_trace(message: String, line: usize, stack_trace: Vec<StackFrame>) -> Self {
+        Self { message, line, stack_trace }
+    }
+    
+    /// 格式化完整的错误信息（包括栈追踪）
+    pub fn format_full(&self) -> String {
+        let mut result = format!("RuntimeError: {} (line {})", self.message, self.line);
+        if !self.stack_trace.is_empty() {
+            result.push_str("\nStack trace:");
+            for frame in &self.stack_trace {
+                result.push('\n');
+                result.push_str(&frame.to_string());
+            }
+        }
+        result
+    }
+}
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format_full())
     }
 }
 
@@ -70,6 +126,8 @@ pub struct VM {
     current_base: usize,
     /// 静态字段缓存 (类名::字段名 -> 值)
     static_fields: std::collections::HashMap<String, Value>,
+    /// VTable 注册表（用于虚方法派发）
+    vtable_registry: super::vtable::VTableRegistry,
 }
 
 impl VM {
@@ -84,6 +142,7 @@ impl VM {
             locale,
             current_base: 0,
             static_fields: std::collections::HashMap::new(),
+            vtable_registry: super::vtable::VTableRegistry::new(),
         }
     }
     
@@ -188,6 +247,20 @@ impl VM {
                 let value = self.peek()?.clone();
                 let actual_slot = self.current_base + slot;
                 self.stack[actual_slot] = value;
+            }
+            OpCode::GetUpvalue => {
+                // 获取 upvalue（当前简化实现，实际需要 upvalue 运行时支持）
+                let _index = self.read_u16() as usize;
+                // TODO: 实现完整的 upvalue 支持
+                self.push_fast(Value::null());
+            }
+            OpCode::SetUpvalue => {
+                let _index = self.read_u16() as usize;
+                // TODO: 实现完整的 upvalue 支持
+            }
+            OpCode::CloseUpvalue => {
+                let _slot = self.read_u16() as usize;
+                // TODO: 实现完整的 upvalue 关闭
             }
             OpCode::PrintLn => {
                 let value = self.pop_fast();
@@ -1078,6 +1151,22 @@ impl VM {
                     self.stack[actual_slot] = value;
                 }
                 
+                OpCode::GetUpvalue => {
+                    let _index = self.read_u16() as usize;
+                    // TODO: 实现完整的 upvalue 支持
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::SetUpvalue => {
+                    let _index = self.read_u16() as usize;
+                    // TODO: 实现完整的 upvalue 支持
+                }
+                
+                OpCode::CloseUpvalue => {
+                    let _slot = self.read_u16() as usize;
+                    // TODO: 实现完整的 upvalue 关闭
+                }
+                
                 OpCode::Jump => {
                     let offset = self.read_u16() as usize;
                     self.ip += offset;
@@ -1465,6 +1554,259 @@ impl VM {
                             obj_val.type_name()
                         )));
                     }
+                }
+                
+                OpCode::SafeInvokeMethod => {
+                    let method_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 获取方法名
+                    let method_name = if let Some(s) = self.chunk.constants[method_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid method name"));
+                    };
+                    
+                    // 获取 receiver（在参数下方）
+                    let receiver_idx = self.stack.len() - arg_count - 1;
+                    let receiver = self.stack[receiver_idx].clone();
+                    
+                    // 如果 receiver 为 null，弹出参数并返回 null
+                    if receiver.is_null() {
+                        // 弹出所有参数和 receiver
+                        self.stack.truncate(receiver_idx);
+                        // 压入 null
+                        self.push(Value::null());
+                        continue;
+                    }
+                    
+                    // 否则执行类/结构体方法调用
+                    if let Some(instance) = receiver.as_class() {
+                        let instance = instance.lock();
+                        let class_name = instance.class_name.clone();
+                        drop(instance);
+                        
+                        if let Some(type_info) = self.chunk.get_type(&class_name).cloned() {
+                            if let Some(&method_index) = type_info.methods.get(&method_name) {
+                                let method_index = method_index as usize;
+                                if let Some(func) = self.chunk.constants[method_index].as_function() {
+                                    let func = func.clone();
+                                    
+                                    // 将 receiver 移到参数前面作为 this
+                                    let this_slot = receiver_idx;
+                                    
+                                    // 检查参数数量
+                                    if arg_count < func.required_params.saturating_sub(1) {
+                                        let msg = format!(
+                                            "Method '{}' expected at least {} arguments but got {}",
+                                            method_name, func.required_params.saturating_sub(1), arg_count
+                                        );
+                                        return Err(self.runtime_error(&msg));
+                                    }
+                                    
+                                    // 填充默认参数
+                                    let missing = func.arity.saturating_sub(arg_count + 1);
+                                    if missing > 0 && !func.defaults.is_empty() {
+                                        let start = func.defaults.len().saturating_sub(missing);
+                                        for i in 0..missing {
+                                            if start + i < func.defaults.len() {
+                                                self.push(func.defaults[start + i].clone());
+                                            }
+                                        }
+                                    }
+                                    
+                                    if self.frames.len() >= MAX_FRAMES {
+                                        return Err(self.runtime_error("Stack overflow"));
+                                    }
+                                    
+                                    let frame = CallFrame {
+                                        return_ip: self.ip as u32,
+                                        base_slot: this_slot as u16,
+                                        is_method_call: true,
+                                    };
+                                    self.frames.push(frame);
+                                    self.ip = func.chunk_index;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(instance) = receiver.as_struct() {
+                        let instance = instance.lock();
+                        let type_name = instance.type_name.clone();
+                        drop(instance);
+                        
+                        if let Some(type_info) = self.chunk.get_type(&type_name).cloned() {
+                            if let Some(&method_index) = type_info.methods.get(&method_name) {
+                                let method_index = method_index as usize;
+                                if let Some(func) = self.chunk.constants[method_index].as_function() {
+                                    let func = func.clone();
+                                    let this_slot = receiver_idx;
+                                    
+                                    if arg_count < func.required_params.saturating_sub(1) {
+                                        let msg = format!(
+                                            "Method '{}' expected at least {} arguments but got {}",
+                                            method_name, func.required_params.saturating_sub(1), arg_count
+                                        );
+                                        return Err(self.runtime_error(&msg));
+                                    }
+                                    
+                                    let missing = func.arity.saturating_sub(arg_count + 1);
+                                    if missing > 0 && !func.defaults.is_empty() {
+                                        let start = func.defaults.len().saturating_sub(missing);
+                                        for i in 0..missing {
+                                            if start + i < func.defaults.len() {
+                                                self.push(func.defaults[start + i].clone());
+                                            }
+                                        }
+                                    }
+                                    
+                                    if self.frames.len() >= MAX_FRAMES {
+                                        return Err(self.runtime_error("Stack overflow"));
+                                    }
+                                    
+                                    let frame = CallFrame {
+                                        return_ip: self.ip as u32,
+                                        base_slot: this_slot as u16,
+                                        is_method_call: true,
+                                    };
+                                    self.frames.push(frame);
+                                    self.ip = func.chunk_index;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    return Err(self.runtime_error(&format!(
+                        "Cannot safely call method '{}' on {}",
+                        method_name, receiver.type_name()
+                    )));
+                }
+                
+                OpCode::NonNullInvokeMethod => {
+                    let method_name_index = self.read_u16() as usize;
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 获取方法名
+                    let method_name = if let Some(s) = self.chunk.constants[method_name_index].as_string() {
+                        s.clone()
+                    } else {
+                        return Err(self.runtime_error("Invalid method name"));
+                    };
+                    
+                    // 获取 receiver（在参数下方）
+                    let receiver_idx = self.stack.len() - arg_count - 1;
+                    let receiver = self.stack[receiver_idx].clone();
+                    
+                    // 如果 receiver 为 null，抛出异常
+                    if receiver.is_null() {
+                        return Err(self.runtime_error(&format!(
+                            "Non-null assertion failed: cannot call method '{}' on null",
+                            method_name
+                        )));
+                    }
+                    
+                    // 否则执行类/结构体方法调用
+                    if let Some(instance) = receiver.as_class() {
+                        let instance = instance.lock();
+                        let class_name = instance.class_name.clone();
+                        drop(instance);
+                        
+                        if let Some(type_info) = self.chunk.get_type(&class_name).cloned() {
+                            if let Some(&method_index) = type_info.methods.get(&method_name) {
+                                let method_index = method_index as usize;
+                                if let Some(func) = self.chunk.constants[method_index].as_function() {
+                                    let func = func.clone();
+                                    let this_slot = receiver_idx;
+                                    
+                                    if arg_count < func.required_params.saturating_sub(1) {
+                                        let msg = format!(
+                                            "Method '{}' expected at least {} arguments but got {}",
+                                            method_name, func.required_params.saturating_sub(1), arg_count
+                                        );
+                                        return Err(self.runtime_error(&msg));
+                                    }
+                                    
+                                    let missing = func.arity.saturating_sub(arg_count + 1);
+                                    if missing > 0 && !func.defaults.is_empty() {
+                                        let start = func.defaults.len().saturating_sub(missing);
+                                        for i in 0..missing {
+                                            if start + i < func.defaults.len() {
+                                                self.push(func.defaults[start + i].clone());
+                                            }
+                                        }
+                                    }
+                                    
+                                    if self.frames.len() >= MAX_FRAMES {
+                                        return Err(self.runtime_error("Stack overflow"));
+                                    }
+                                    
+                                    let frame = CallFrame {
+                                        return_ip: self.ip as u32,
+                                        base_slot: this_slot as u16,
+                                        is_method_call: true,
+                                    };
+                                    self.frames.push(frame);
+                                    self.ip = func.chunk_index;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(instance) = receiver.as_struct() {
+                        let instance = instance.lock();
+                        let type_name = instance.type_name.clone();
+                        drop(instance);
+                        
+                        if let Some(type_info) = self.chunk.get_type(&type_name).cloned() {
+                            if let Some(&method_index) = type_info.methods.get(&method_name) {
+                                let method_index = method_index as usize;
+                                if let Some(func) = self.chunk.constants[method_index].as_function() {
+                                    let func = func.clone();
+                                    let this_slot = receiver_idx;
+                                    
+                                    if arg_count < func.required_params.saturating_sub(1) {
+                                        let msg = format!(
+                                            "Method '{}' expected at least {} arguments but got {}",
+                                            method_name, func.required_params.saturating_sub(1), arg_count
+                                        );
+                                        return Err(self.runtime_error(&msg));
+                                    }
+                                    
+                                    let missing = func.arity.saturating_sub(arg_count + 1);
+                                    if missing > 0 && !func.defaults.is_empty() {
+                                        let start = func.defaults.len().saturating_sub(missing);
+                                        for i in 0..missing {
+                                            if start + i < func.defaults.len() {
+                                                self.push(func.defaults[start + i].clone());
+                                            }
+                                        }
+                                    }
+                                    
+                                    if self.frames.len() >= MAX_FRAMES {
+                                        return Err(self.runtime_error("Stack overflow"));
+                                    }
+                                    
+                                    let frame = CallFrame {
+                                        return_ip: self.ip as u32,
+                                        base_slot: this_slot as u16,
+                                        is_method_call: true,
+                                    };
+                                    self.frames.push(frame);
+                                    self.ip = func.chunk_index;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    
+                    return Err(self.runtime_error(&format!(
+                        "Cannot call method '{}' on {}",
+                        method_name, receiver.type_name()
+                    )));
                 }
                 
                 OpCode::InvokeMethod => {
@@ -3632,7 +3974,63 @@ impl VM {
     
     fn runtime_error(&self, message: &str) -> RuntimeError {
         let line = self.chunk.get_line(self.ip.saturating_sub(1));
-        RuntimeError::new(message.to_string(), line)
+        let stack_trace = self.capture_stack_trace();
+        RuntimeError::with_trace(message.to_string(), line, stack_trace)
+    }
+    
+    /// 捕获当前的栈追踪
+    fn capture_stack_trace(&self) -> Vec<StackFrame> {
+        let mut trace = Vec::new();
+        
+        // 当前执行位置
+        let current_line = self.chunk.get_line(self.ip.saturating_sub(1));
+        let current_func = self.get_current_function_name();
+        trace.push(StackFrame {
+            function_name: current_func,
+            file_name: None, // TODO: 添加文件名跟踪
+            line: current_line,
+            column: None,
+        });
+        
+        // 遍历调用帧（从最近的到最远的）
+        for frame in self.frames.iter().rev() {
+            let return_ip = frame.return_ip as usize;
+            let frame_line = if return_ip > 0 {
+                self.chunk.get_line(return_ip.saturating_sub(1))
+            } else {
+                0
+            };
+            
+            // 获取函数名（如果可能）
+            let func_name = self.get_function_name_at(return_ip);
+            
+            trace.push(StackFrame {
+                function_name: func_name,
+                file_name: None,
+                line: frame_line,
+                column: None,
+            });
+        }
+        
+        trace
+    }
+    
+    /// 获取当前执行的函数名
+    fn get_current_function_name(&self) -> String {
+        // 尝试从调用帧中推断函数名
+        // 如果没有调用帧，说明在顶层代码
+        if self.frames.is_empty() {
+            "<main>".to_string()
+        } else {
+            "<function>".to_string()
+        }
+    }
+    
+    /// 获取指定位置的函数名
+    fn get_function_name_at(&self, _ip: usize) -> String {
+        // TODO: 从字节码元数据中获取函数名
+        // 目前返回通用名称
+        "<caller>".to_string()
     }
     
     /// 调用闭包函数并返回结果
@@ -3758,6 +4156,16 @@ impl VM {
                 let value = self.peek()?.clone();
                 let actual_slot = self.current_base + slot;
                 self.stack[actual_slot] = value;
+            }
+            OpCode::GetUpvalue => {
+                let _index = self.read_u16() as usize;
+                self.push_fast(Value::null());
+            }
+            OpCode::SetUpvalue => {
+                let _index = self.read_u16() as usize;
+            }
+            OpCode::CloseUpvalue => {
+                let _slot = self.read_u16() as usize;
             }
             OpCode::Const => {
                 let index = self.read_u16() as usize;
@@ -4242,6 +4650,16 @@ impl VM {
                 let value = self.stack.last().cloned().unwrap_or(Value::null());
                 self.stack[base + slot] = value;
             }
+            OpCode::GetUpvalue => {
+                let _index = self.read_u16() as usize;
+                self.push(Value::null());
+            }
+            OpCode::SetUpvalue => {
+                let _index = self.read_u16() as usize;
+            }
+            OpCode::CloseUpvalue => {
+                let _slot = self.read_u16() as usize;
+            }
             OpCode::Add => {
                 let b = self.pop()?;
                 let a = self.pop()?;
@@ -4488,6 +4906,16 @@ impl VM {
                 let actual_slot = self.current_base + slot;
                 self.stack[actual_slot] = value;
             }
+            OpCode::GetUpvalue => {
+                let _index = self.read_u16() as usize;
+                self.push_fast(Value::null());
+            }
+            OpCode::SetUpvalue => {
+                let _index = self.read_u16() as usize;
+            }
+            OpCode::CloseUpvalue => {
+                let _slot = self.read_u16() as usize;
+            }
             OpCode::Jump => {
                 let offset = self.read_u16() as usize;
                 self.ip = offset;
@@ -4644,6 +5072,130 @@ impl VM {
         }
         
         Ok(())
+    }
+    
+    // ============ VTable 和运行时类型支持 ============
+    
+    /// 获取或创建类型的 VTable
+    pub fn get_or_create_vtable(&mut self, type_name: &str) -> std::sync::Arc<super::vtable::VTable> {
+        self.vtable_registry.get_or_create(type_name)
+    }
+    
+    /// 注册类型的 VTable
+    pub fn register_vtable(&mut self, vtable: super::vtable::VTable) -> std::sync::Arc<super::vtable::VTable> {
+        self.vtable_registry.register(vtable)
+    }
+    
+    /// 检查值是否实现了指定的 trait
+    pub fn value_implements_trait(&self, value: &Value, trait_name: &str) -> bool {
+        // 获取值的类型名
+        let type_name = if let Some(instance) = value.as_class() {
+            instance.lock().class_name.clone()
+        } else if let Some(instance) = value.as_struct() {
+            instance.lock().type_name.clone()
+        } else {
+            return false;
+        };
+        
+        // 查找类型的 VTable
+        if let Some(vtable) = self.vtable_registry.lookup_by_name(&type_name) {
+            return vtable.implements_trait(trait_name);
+        }
+        
+        false
+    }
+    
+    /// 通过 VTable 调用方法
+    pub fn vtable_dispatch(&mut self, receiver: &Value, method_name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        // 获取值的类型名
+        let type_name = if let Some(instance) = receiver.as_class() {
+            instance.lock().class_name.clone()
+        } else if let Some(instance) = receiver.as_struct() {
+            instance.lock().type_name.clone()
+        } else {
+            return Err(self.runtime_error(&format!(
+                "Cannot dispatch method '{}' on non-object type",
+                method_name
+            )));
+        };
+        
+        // 查找 VTable
+        if let Some(vtable) = self.vtable_registry.lookup_by_name(&type_name) {
+            if let Some(func_index) = vtable.get_method_func_index(method_name) {
+                // 获取函数并克隆以避免借用冲突
+                let func = self.chunk.constants[func_index].as_function().cloned();
+                if let Some(func) = func {
+                    return self.call_closure(&func, &args);
+                }
+            }
+        }
+        
+        // 回退到类型定义中的方法查找
+        if let Some(type_info) = self.chunk.get_type(&type_name).cloned() {
+            if let Some(&method_index) = type_info.methods.get(method_name) {
+                let func = self.chunk.constants[method_index as usize].as_function().cloned();
+                if let Some(func) = func {
+                    return self.call_closure(&func, &args);
+                }
+            }
+        }
+        
+        Err(self.runtime_error(&format!(
+            "Method '{}' not found on type '{}'",
+            method_name, type_name
+        )))
+    }
+    
+    /// 初始化类型的 VTable（从类型信息构建）
+    pub fn init_type_vtable(&mut self, type_name: &str) -> Option<std::sync::Arc<super::vtable::VTable>> {
+        let type_info = self.chunk.get_type(type_name)?.clone();
+        
+        let type_id = self.vtable_registry.allocate_type_id();
+        let mut vtable = if let Some(parent) = &type_info.parent {
+            // 如果有父类，先获取或创建父类的 VTable
+            if let Some(parent_vtable) = self.vtable_registry.lookup_by_name(parent) {
+                super::vtable::VTable::with_parent(type_id, type_name, (*parent_vtable).clone())
+            } else {
+                super::vtable::VTable::new(type_id, type_name)
+            }
+        } else {
+            super::vtable::VTable::new(type_id, type_name)
+        };
+        
+        // 注册方法
+        for (method_name, method_index) in &type_info.methods {
+            vtable.register_method(method_name.clone(), *method_index as usize);
+        }
+        
+        // 注：trait 实现需要在编译时处理，通过 TraitVTable 注册
+        // 目前 TypeInfo 没有 traits 字段，trait 支持需要后续版本完善
+        
+        Some(self.vtable_registry.register(vtable))
+    }
+    
+    /// 获取值的运行时类型信息
+    pub fn get_runtime_type_info(&self, value: &Value) -> Option<super::vtable::RuntimeTypeInfo> {
+        let type_name = if let Some(instance) = value.as_class() {
+            instance.lock().class_name.clone()
+        } else if let Some(instance) = value.as_struct() {
+            instance.lock().type_name.clone()
+        } else {
+            return None;
+        };
+        
+        let type_info = self.chunk.get_type(&type_name)?;
+        let vtable = self.vtable_registry.lookup_by_name(&type_name);
+        
+        let type_id = vtable.as_ref().map(|v| v.type_id).unwrap_or(0);
+        let mut info = super::vtable::RuntimeTypeInfo::new(type_id, &type_name);
+        
+        // 添加字段信息
+        for field_name in &type_info.fields {
+            info.add_field(field_name.clone(), true);
+        }
+        
+        info.vtable = vtable;
+        Some(info)
     }
 }
 

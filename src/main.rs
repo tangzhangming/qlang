@@ -12,6 +12,7 @@ mod types;
 mod package;
 mod stdlib;
 mod runtime;
+mod typechecker;
 
 use std::env;
 use std::fs;
@@ -23,9 +24,15 @@ use lexer::Scanner;
 use parser::Parser;
 use compiler::Compiler;
 use vm::VM;
+use typechecker::{TypeChecker, Monomorphizer};
 
 /// 运行源代码
 fn run(source: &str, locale: Locale) -> Result<(), String> {
+    run_with_options(source, locale, true)
+}
+
+/// 运行源代码（带选项）
+fn run_with_options(source: &str, locale: Locale, type_check: bool) -> Result<(), String> {
     // 词法分析
     let mut scanner = Scanner::new(source);
     let tokens = scanner.scan_tokens();
@@ -51,6 +58,27 @@ fn run(source: &str, locale: Locale) -> Result<(), String> {
             .collect::<Vec<_>>()
             .join("\n")
     })?;
+    
+    // 类型检查（可选）
+    if type_check {
+        let mut type_checker = TypeChecker::new();
+        type_checker.check_program(&program).map_err(|errors| {
+            errors
+                .iter()
+                .map(|e| format!("[{}:{}] {}", e.span.line, e.span.column, e))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        
+        // 收集泛型定义用于单态化
+        let mut monomorphizer = Monomorphizer::new();
+        monomorphizer.collect_definitions(&program);
+        
+        // 处理所有待单态化的请求
+        // 注意：完整的单态化需要在类型检查期间收集泛型使用情况
+        // 这里只是设置基础架构，实际的单态化请求会在后续版本中完善
+        monomorphizer.process_all();
+    }
     
     // 编译
     let mut compiler = Compiler::new(locale);

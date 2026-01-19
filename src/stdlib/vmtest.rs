@@ -24,7 +24,7 @@ impl VmTestLib {
         
         if !condition {
             let message = if args.len() > 1 {
-                args[1].as_string().map(|s| s.clone()).unwrap_or_else(|| "Assertion failed".to_string())
+                args[1].as_string().cloned().unwrap_or_else(|| "Assertion failed".to_string())
             } else {
                 "Assertion failed".to_string()
             };
@@ -45,7 +45,7 @@ impl VmTestLib {
         
         if actual != expected {
             let message = if args.len() > 2 {
-                args[2].as_string().map(|s| s.clone())
+                args[2].as_string().cloned()
                     .unwrap_or_else(|| format!("Expected {:?}, but got {:?}", expected, actual))
             } else {
                 format!("Expected {:?}, but got {:?}", expected, actual)
@@ -67,7 +67,7 @@ impl VmTestLib {
         
         if !condition {
             let message = if args.len() > 1 {
-                args[1].as_string().map(|s| s.clone()).unwrap_or_else(|| "Expected true, but got false".to_string())
+                args[1].as_string().cloned().unwrap_or_else(|| "Expected true, but got false".to_string())
             } else {
                 "Expected true, but got false".to_string()
             };
@@ -88,7 +88,7 @@ impl VmTestLib {
         
         if condition {
             let message = if args.len() > 1 {
-                args[1].as_string().map(|s| s.clone()).unwrap_or_else(|| "Expected false, but got true".to_string())
+                args[1].as_string().cloned().unwrap_or_else(|| "Expected false, but got true".to_string())
             } else {
                 "Expected false, but got true".to_string()
             };
@@ -106,7 +106,7 @@ impl VmTestLib {
         
         if !args[0].is_null() {
             let message = if args.len() > 1 {
-                args[1].as_string().map(|s| s.clone()).unwrap_or_else(|| "Expected null".to_string())
+                args[1].as_string().cloned().unwrap_or_else(|| "Expected null".to_string())
             } else {
                 format!("Expected null, but got {:?}", args[0])
             };
@@ -124,7 +124,7 @@ impl VmTestLib {
         
         if args[0].is_null() {
             let message = if args.len() > 1 {
-                args[1].as_string().map(|s| s.clone()).unwrap_or_else(|| "Expected non-null value".to_string())
+                args[1].as_string().cloned().unwrap_or_else(|| "Expected non-null value".to_string())
             } else {
                 "Expected non-null value, but got null".to_string()
             };
@@ -137,7 +137,7 @@ impl VmTestLib {
     /// 测试失败
     fn fail(args: &[Value]) -> Result<Value, String> {
         let message = if !args.is_empty() {
-            args[0].as_string().map(|s| s.clone()).unwrap_or_else(|| "Test failed".to_string())
+            args[0].as_string().cloned().unwrap_or_else(|| "Test failed".to_string())
         } else {
             "Test failed".to_string()
         };
