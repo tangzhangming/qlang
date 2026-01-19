@@ -1,0 +1,154 @@
+%YAML 1.2
+---
+name: Q
+file_extensions:
+  - q
+scope: source.q
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: keywords
+    - include: types
+    - include: constants
+    - include: operators
+    - include: functions
+    - include: classes
+    - include: identifiers
+
+  comments:
+    - match: '///'
+      scope: punctuation.definition.comment.q
+      push:
+        - meta_scope: comment.line.documentation.q
+        - match: $
+          pop: true
+    - match: '//'
+      scope: punctuation.definition.comment.q
+      push:
+        - meta_scope: comment.line.q
+        - match: $
+          pop: true
+    - match: '/\*'
+      scope: punctuation.definition.comment.begin.q
+      push:
+        - meta_scope: comment.block.q
+        - match: '\*/'
+          scope: punctuation.definition.comment.end.q
+          pop: true
+
+  strings:
+    - match: "'''"
+      scope: punctuation.definition.string.begin.q
+      push:
+        - meta_scope: string.quoted.single.q
+        - match: "'''"
+          scope: punctuation.definition.string.end.q
+          pop: true
+    - match: '"""'
+      scope: punctuation.definition.string.begin.q
+      push:
+        - meta_scope: string.quoted.double.q
+        - include: interpolation
+        - match: '"""'
+          scope: punctuation.definition.string.end.q
+          pop: true
+    - match: "'"
+      scope: punctuation.definition.string.begin.q
+      push:
+        - meta_scope: string.quoted.single.q
+        - match: "'"
+          scope: punctuation.definition.string.end.q
+          pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.q
+      push:
+        - meta_scope: string.quoted.double.q
+        - match: '\\\\.'
+          scope: constant.character.escape.q
+        - include: interpolation
+        - match: '"'
+          scope: punctuation.definition.string.end.q
+          pop: true
+
+  interpolation:
+    - match: '\$\{'
+      scope: punctuation.section.interpolation.begin.q
+      push:
+        - meta_scope: meta.interpolation.q
+        - include: expressions
+        - match: '\}'
+          scope: punctuation.section.interpolation.end.q
+          pop: true
+
+  expressions:
+    - include: numbers
+    - include: keywords
+    - include: types
+    - include: constants
+    - include: operators
+    - include: functions
+    - include: identifiers
+
+  numbers:
+    - match: '\b0x[0-9A-Fa-f_]+\b'
+      scope: constant.numeric.integer.hexadecimal.q
+    - match: '\b0b[01_]+\b'
+      scope: constant.numeric.integer.binary.q
+    - match: '\b0o[0-7_]+\b'
+      scope: constant.numeric.integer.octal.q
+    - match: '\b\d+\.\d+([eE][+-]?\d+)?\b'
+      scope: constant.numeric.float.q
+    - match: '\b\d+([eE][+-]?\d+)?\b'
+      scope: constant.numeric.integer.decimal.q
+
+  keywords:
+    - match: '\b(var|const|func|struct|class|interface|trait|enum|type)\b'
+      scope: keyword.declaration.q
+    - match: '\b(public|internal|private|protected)\b'
+      scope: storage.modifier.q
+    - match: '\b(if|else|for|break|continue|return|match|go)\b'
+      scope: keyword.control.q
+    - match: '\b(new|this|super|extends|implements|use|abstract|static|override)\b'
+      scope: keyword.other.q
+    - match: '\b(import|package|as|in|is|try|catch|finally|throw)\b'
+      scope: keyword.other.q
+    - match: '\b(make|default|sizeof|typeof|panic)\b'
+      scope: support.function.builtin.q
+    - match: '\bas!\b'
+      scope: keyword.operator.q
+    - match: '\bas\b'
+      scope: keyword.operator.q
+
+  types:
+    - match: '\b(int|uint|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|byte|char|string|unknown|dynamic)\b'
+      scope: storage.type.q
+    - match: '\bmap\b'
+      scope: storage.type.q
+    - match: '\bfunc\b'
+      scope: storage.type.q
+
+  constants:
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.q
+
+  operators:
+    - match: '\?\?|\?\.|==|!=|<=|>=|&&|\|\||<<=|>>=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|->|=>'
+      scope: keyword.operator.q
+    - match: '\.\.\.?|[=+\-*/%&|^!~<>?:]'
+      scope: keyword.operator.q
+
+  functions:
+    - match: '\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()'
+      scope: entity.name.function.q
+
+  classes:
+    - match: '\b(class|struct|interface|trait|enum)\s+([A-Za-z_][A-Za-z0-9_]*)\b'
+      captures:
+        1: keyword.declaration.q
+        2: entity.name.type.q
+
+  identifiers:
+    - match: '\b[A-Za-z_][A-Za-z0-9_]*\b'
+      scope: variable.other.q

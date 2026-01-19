@@ -1,4 +1,6 @@
 .cursorrules
+.cargo
+.claude
 /target
 /example
 /benchmark

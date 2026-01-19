@@ -42,35 +42,62 @@ pub struct TypeChecker {
 impl TypeChecker {
     /// 创建新的类型检查器
     pub fn new() -> Self {
-        let mut checker = Self {
+        Self {
             env: TypeEnvironment::new(),
             solver: ConstraintSolver::new(),
             errors: Vec::new(),
             in_function: false,
             in_loop: false,
             context: CompileContext::default(),
-        };
-        checker.register_stdlib_types();
-        checker
+        }
+        // 注意：不再自动注册标准库类型，必须通过 import 显式导入
     }
     
     /// 创建带上下文的类型检查器
     pub fn with_context(context: CompileContext) -> Self {
-        let mut checker = Self {
+        Self {
             env: TypeEnvironment::new(),
             solver: ConstraintSolver::new(),
             errors: Vec::new(),
             in_function: false,
             in_loop: false,
             context,
-        };
-        checker.register_stdlib_types();
-        checker
+        }
+        // 注意：不再自动注册标准库类型，必须通过 import 显式导入
     }
     
-    /// 注册标准库类型
-    fn register_stdlib_types(&mut self) {
-        // std.net.tcp.TCPSocket
+    // ==================== 按模块注册标准库类型 ====================
+    
+    /// 注册 std.net.tcp 模块的所有类型
+    fn register_net_tcp_types(&mut self) {
+        self.register_tcp_socket();
+        self.register_tcp_listener();
+    }
+    
+    /// 注册 std.net.http 模块的所有类型
+    fn register_net_http_types(&mut self) {
+        self.register_http_client();
+        self.register_http_server();
+        self.register_http_request();
+        self.register_http_response();
+    }
+    
+    /// 注册 std.lang 模块的所有类型（异常类）
+    fn register_lang_types(&mut self) {
+        for exc_name in &[
+            "Throwable", "Error", "Exception", 
+            "RuntimeException", "NullPointerException", "IndexOutOfBoundsException",
+            "IllegalArgumentException", "ArithmeticException", "ClassCastException",
+            "IOException", "FileNotFoundException", "NetworkException", "TimeoutException",
+        ] {
+            self.register_exception_class(exc_name);
+        }
+    }
+    
+    // ==================== 按类注册标准库类型 ====================
+    
+    /// 注册 TCPSocket 类
+    fn register_tcp_socket(&mut self) {
         self.register_stdlib_class(
             "TCPSocket",
             vec![
@@ -87,8 +114,10 @@ impl TypeChecker {
                 ("port", Type::Int),
             ]),
         );
-        
-        // std.net.tcp.TCPListener
+    }
+    
+    /// 注册 TCPListener 类
+    fn register_tcp_listener(&mut self) {
         self.register_stdlib_class(
             "TCPListener",
             vec![
@@ -100,8 +129,10 @@ impl TypeChecker {
                 ("port", Type::Int),
             ]),
         );
-        
-        // std.net.http.HttpClient
+    }
+    
+    /// 注册 HttpClient 类
+    fn register_http_client(&mut self) {
         self.register_stdlib_class(
             "HttpClient",
             vec![
@@ -113,14 +144,16 @@ impl TypeChecker {
                 ("setTimeout", vec![("timeout_ms", Type::Int)], Type::Null),
                 ("close", vec![], Type::Null),
             ],
-            None, // 无参数或可选参数的构造函数
+            None,
         );
-        
-        // std.net.http.HttpServer
+    }
+    
+    /// 注册 HttpServer 类
+    fn register_http_server(&mut self) {
         self.register_stdlib_class(
             "HttpServer",
             vec![
-                ("listen", vec![("handler", Type::Unknown)], Type::Null),  // handler 是函数，使用 unknown
+                ("listen", vec![("handler", Type::Unknown)], Type::Null),
                 ("stop", vec![], Type::Null),
             ],
             Some(vec![
@@ -128,19 +161,29 @@ impl TypeChecker {
                 ("port", Type::Int),
             ]),
         );
-        
-        // std.net.http.HttpRequest
-        self.register_stdlib_class(
+    }
+    
+    /// 注册 HttpRequest 类
+    fn register_http_request(&mut self) {
+        self.register_stdlib_class_with_fields(
             "HttpRequest",
             vec![
                 ("getHeader", vec![("name", Type::String)], Type::String),
                 ("getQuery", vec![("name", Type::String)], Type::String),
             ],
             None,
+            vec![
+                ("method", Type::String),
+                ("path", Type::String),
+                ("body", Type::String),
+                ("headers", Type::Map { key_type: Box::new(Type::String), value_type: Box::new(Type::String) }),
+            ],
         );
-        
-        // std.net.http.HttpResponse
-        self.register_stdlib_class(
+    }
+    
+    /// 注册 HttpResponse 类
+    fn register_http_response(&mut self) {
+        self.register_stdlib_class_with_fields(
             "HttpResponse",
             vec![
                 ("text", vec![], Type::String),
@@ -148,25 +191,75 @@ impl TypeChecker {
             ],
             Some(vec![
                 ("status", Type::Int),
+                ("body", Type::String),
             ]),
+            vec![
+                ("status", Type::Int),
+                ("body", Type::String),
+                ("headers", Type::Map { key_type: Box::new(Type::String), value_type: Box::new(Type::String) }),
+            ],
         );
+    }
+    
+    /// 注册异常类
+    fn register_exception_class(&mut self, name: &str) {
+        self.register_stdlib_class_with_fields(
+            name,
+            vec![
+                ("toString", vec![], Type::String),
+                ("getMessage", vec![], Type::String),
+            ],
+            Some(vec![("message", Type::String)]),
+            vec![("message", Type::String)],
+        );
+    }
+    
+    /// 根据类名注册单个标准库类型
+    fn register_stdlib_type_by_name(&mut self, name: &str) {
+        match name {
+            // std.net.tcp
+            "TCPSocket" => self.register_tcp_socket(),
+            "TCPListener" => self.register_tcp_listener(),
+            // std.net.http
+            "HttpClient" => self.register_http_client(),
+            "HttpServer" => self.register_http_server(),
+            "HttpRequest" => self.register_http_request(),
+            "HttpResponse" => self.register_http_response(),
+            // std.lang - 异常类
+            "Throwable" | "Error" | "Exception" | 
+            "RuntimeException" | "NullPointerException" | "IndexOutOfBoundsException" |
+            "IllegalArgumentException" | "ArithmeticException" | "ClassCastException" |
+            "IOException" | "FileNotFoundException" | "NetworkException" | "TimeoutException" => {
+                self.register_exception_class(name);
+            }
+            _ => {} // 未知类型，忽略
+        }
+    }
+    
+    /// 处理 import 声明，注册相应的类型
+    fn process_import(&mut self, path: &str, target: &crate::parser::ast::ImportTarget) {
+        use crate::parser::ast::ImportTarget;
         
-        // std.lang.Exception 及其子类
-        for exc_name in &[
-            "Throwable", "Error", "Exception", 
-            "RuntimeException", "NullPointerException", "IndexOutOfBoundsException",
-            "IllegalArgumentException", "ArithmeticException", "ClassCastException",
-            "IOException", "FileNotFoundException", "NetworkException", "TimeoutException",
-        ] {
-            self.register_stdlib_class_with_fields(
-                exc_name,
-                vec![
-                    ("toString", vec![], Type::String),
-                    ("getMessage", vec![], Type::String),
-                ],
-                Some(vec![("message", Type::String)]),
-                vec![("message", Type::String)],  // 字段
-            );
+        match target {
+            ImportTarget::All => {
+                // import std.net.http.* - 注册模块所有类型
+                match path {
+                    "std.net.tcp" => self.register_net_tcp_types(),
+                    "std.net.http" => self.register_net_http_types(),
+                    "std.lang" => self.register_lang_types(),
+                    _ => {}
+                }
+            }
+            ImportTarget::Single(name) => {
+                // import std.net.http.HttpServer - 只注册单个类型
+                self.register_stdlib_type_by_name(name);
+            }
+            ImportTarget::Multiple(names) => {
+                // import std.net.http.{HttpClient, HttpServer} - 注册多个类型
+                for name in names {
+                    self.register_stdlib_type_by_name(name);
+                }
+            }
         }
     }
     
@@ -365,6 +458,11 @@ impl TypeChecker {
     pub fn check_program(&mut self, program: &Program) -> Result<(), Vec<TypeError>> {
         // 0. 验证包名
         self.validate_package(program);
+        
+        // 0.5. 处理 import 声明，注册导入的类型
+        for import in &program.imports {
+            self.process_import(&import.path, &import.target);
+        }
         
         // 1. 检查顶级代码限制
         for stmt in &program.statements {
@@ -876,6 +974,11 @@ impl TypeChecker {
             }
             Stmt::Throw { value, span } => {
                 self.infer_expr(value)?;
+                Ok(())
+            }
+            Stmt::Import { import, .. } => {
+                // 根据 import 声明注册相应的标准库类型
+                self.process_import(&import.path, &import.target);
                 Ok(())
             }
             // 其他语句类型已在第一遍处理

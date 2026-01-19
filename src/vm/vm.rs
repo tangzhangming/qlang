@@ -2190,15 +2190,31 @@ impl VM {
                             let args = self.stack[args_start..].to_vec();
                             // 弹出参数和receiver
                             self.stack.truncate(receiver_idx);
-                            
-                            // 调用标准库方法
-                            match registry.call_class_method(&receiver, &method_name, &args) {
-                                Ok(result) => {
-                                    self.push(result);
-                                    continue;
+
+                            // 检查是否需要回调支持
+                            if registry.needs_callback(&class_name, &method_name) {
+                                // 需要回调支持的方法 - 创建回调通道
+                                use crate::stdlib::CallbackChannel;
+                                let callback_channel = Arc::new(CallbackChannel::new());
+                                match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
-                                Err(e) => {
-                                    return Err(self.runtime_error(&e));
+                            } else {
+                                // 普通方法调用
+                                match registry.call_class_method(&receiver, &method_name, &args) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
                             }
                         }
@@ -2347,15 +2363,31 @@ impl VM {
                             let args = self.stack[args_start..].to_vec();
                             // 弹出参数和receiver
                             self.stack.truncate(receiver_idx);
-                            
-                            // 调用标准库方法
-                            match registry.call_class_method(&receiver, &method_name, &args) {
-                                Ok(result) => {
-                                    self.push(result);
-                                    continue;
+
+                            // 检查是否需要回调支持
+                            if registry.needs_callback(&class_name, &method_name) {
+                                // 需要回调支持的方法 - 创建回调通道
+                                use crate::stdlib::CallbackChannel;
+                                let callback_channel = Arc::new(CallbackChannel::new());
+                                match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
-                                Err(e) => {
-                                    return Err(self.runtime_error(&e));
+                            } else {
+                                // 普通方法调用
+                                match registry.call_class_method(&receiver, &method_name, &args) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
                             }
                         }
@@ -2492,15 +2524,31 @@ impl VM {
                             let args = self.stack[args_start..].to_vec();
                             // 弹出参数和receiver
                             self.stack.truncate(receiver_idx);
-                            
-                            // 调用标准库方法
-                            match registry.call_class_method(&receiver, &method_name, &args) {
-                                Ok(result) => {
-                                    self.push(result);
-                                    continue;
+
+                            // 检查是否需要回调支持
+                            if registry.needs_callback(&class_name, &method_name) {
+                                // 需要回调支持的方法 - 创建回调通道
+                                use crate::stdlib::CallbackChannel;
+                                let callback_channel = Arc::new(CallbackChannel::new());
+                                match registry.call_class_method_with_callback(&receiver, &method_name, &args, callback_channel) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
-                                Err(e) => {
-                                    return Err(self.runtime_error(&e));
+                            } else {
+                                // 普通方法调用
+                                match registry.call_class_method(&receiver, &method_name, &args) {
+                                    Ok(result) => {
+                                        self.push(result);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        return Err(self.runtime_error(&e));
+                                    }
                                 }
                             }
                         }
