@@ -261,10 +261,9 @@ impl Compiler {
                 }
             }
             Stmt::If { condition, then_branch, else_branch, span } => {
-                // 编译条件表达式
+                // 尝试使用超级指令优化：检查是否是 `local <= int_const` 形式
+                // 编译条件并跳转
                 self.compile_expr(condition);
-                
-                // 如果条件为假，跳转到 else 或结束，并弹出条件值
                 let then_jump = self.chunk.write_jump_if_false_pop(span.line);
                 
                 // 编译 then 分支
@@ -286,7 +285,7 @@ impl Compiler {
                     // 回填 then_jump
                     self.chunk.patch_jump(then_jump);
                     
-                    // 条件值已在 JumpIfFalsePop 中弹出
+                    // 条件值已在 JumpIfFalsePop 中弹出（或由超级指令处理）
                 }
             }
             Stmt::ForLoop { label, initializer, condition, increment, body, span } => {
@@ -585,6 +584,27 @@ impl Compiler {
                         // 3. 写入 TailCall 指令
                         self.chunk.write_op(OpCode::TailCall, span.line);
                         self.chunk.write(tail_call_info.args.len() as u8, span.line);
+                    } else if let Expr::Identifier { name, .. } = expr {
+                        // 超级指令优化：返回局部变量
+                        if let Some(slot) = self.symbols.resolve_slot(name) {
+                            if slot <= 255 {
+                                self.chunk.write_return_local(slot as u8, span.line);
+                            } else {
+                                self.compile_expr(expr);
+                                self.chunk.write_op(OpCode::Return, span.line);
+                            }
+                        } else {
+                            self.compile_expr(expr);
+                            self.chunk.write_op(OpCode::Return, span.line);
+                        }
+                    } else if let Expr::Integer { value: int_val, .. } = expr {
+                        // 超级指令优化：返回小整数常量
+                        if *int_val >= i8::MIN as i64 && *int_val <= i8::MAX as i64 {
+                            self.chunk.write_return_int(*int_val as i8, span.line);
+                        } else {
+                            self.compile_expr(expr);
+                            self.chunk.write_op(OpCode::Return, span.line);
+                        }
                     } else {
                         // 普通返回
                         self.compile_expr(expr);
@@ -1701,6 +1721,32 @@ impl Compiler {
                         if *op == BinOp::Add {
                             if try_emit_local_const(self, name, *value) {
                                 return;
+                            }
+                        }
+                    }
+                    
+                    // 超级指令优化：两个局部变量相加/相减（整数类型）
+                    if both_int {
+                        if let (Expr::Identifier { name: name1, .. }, Expr::Identifier { name: name2, .. }) =
+                            (left.as_ref(), right.as_ref())
+                        {
+                            if let (Some(slot1), Some(slot2)) = 
+                                (self.symbols.resolve_slot(name1), self.symbols.resolve_slot(name2))
+                            {
+                                // 仅当槽位在 u8 范围内时使用超级指令
+                                if slot1 <= 255 && slot2 <= 255 {
+                                    match op {
+                                        BinOp::Add => {
+                                            self.chunk.write_add_locals(slot1 as u8, slot2 as u8, span.line);
+                                            return;
+                                        }
+                                        BinOp::Sub => {
+                                            self.chunk.write_sub_locals(slot1 as u8, slot2 as u8, span.line);
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     }

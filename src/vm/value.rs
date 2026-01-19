@@ -626,6 +626,24 @@ pub struct HeapWaitGroup {
 pub struct Value(u64);
 
 impl Value {
+    // ========== 位操作（用于栈顶缓存优化） ==========
+    
+    /// 将 Value 转换为原始 u64 位表示
+    /// 
+    /// 用于栈顶缓存优化，将 Value 存储在局部变量（CPU 寄存器）中
+    #[inline(always)]
+    pub const fn to_bits(self) -> u64 {
+        self.0
+    }
+    
+    /// 从原始 u64 位表示创建 Value
+    /// 
+    /// 用于从栈顶缓存恢复 Value
+    #[inline(always)]
+    pub const fn from_bits(bits: u64) -> Self {
+        Value(bits)
+    }
+    
     // ========== 构造函数 ==========
     
     /// 创建 Null 值

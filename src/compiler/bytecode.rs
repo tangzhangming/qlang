@@ -387,12 +387,58 @@ pub enum OpCode {
     /// 获取枚举关联数据字段
     /// 操作数: field_name_idx (u16)
     /// 栈: [..., enum_value] -> [..., field_value]
-    EnumGetField = 180,
+    EnumGetField = 185,
     
     /// 枚举匹配（检查是否为指定变体）
     /// 操作数: variant_name_idx (u16)
     /// 栈: [..., enum_value] -> [..., is_match:bool]
-    EnumMatch = 181,
+    EnumMatch = 186,
+    
+    // ============ 超级指令 (200-220) ============
+    /// 两个局部变量相加（整数快速路径）
+    /// 操作数: slot1 (u8), slot2 (u8)
+    /// 栈: [...] -> [..., result]
+    AddLocals = 200,
+    
+    /// 两个局部变量相减（整数快速路径）
+    /// 操作数: slot1 (u8), slot2 (u8)
+    /// 栈: [...] -> [..., result]
+    SubLocals = 201,
+    
+    /// 局部变量与常量比较后跳转（小于等于）
+    /// 操作数: slot (u8), const_val (i8), offset (i16)
+    /// 栈: [...] -> [...] (跳转或继续)
+    JumpIfLocalLeConst = 202,
+    
+    /// 局部变量与常量比较后跳转（小于）
+    /// 操作数: slot (u8), const_val (i8), offset (i16)
+    /// 栈: [...] -> [...] (跳转或继续)
+    JumpIfLocalLtConst = 203,
+    
+    /// 获取局部变量并调用（快速单参数调用）
+    /// 操作数: slot (u8)
+    /// 栈: [..., func] -> [..., result]
+    CallWithLocal = 204,
+    
+    /// 返回局部变量
+    /// 操作数: slot (u8)
+    /// 栈: [...] -> 返回
+    ReturnLocal = 205,
+    
+    /// 返回小整数常量
+    /// 操作数: value (i8)
+    /// 栈: [...] -> 返回
+    ReturnInt = 206,
+    
+    /// 加载两个局部变量
+    /// 操作数: slot1 (u8), slot2 (u8)
+    /// 栈: [...] -> [..., val1, val2]
+    LoadLocals2 = 207,
+    
+    /// 递归调用自身（优化：直接跳到函数开头）
+    /// 操作数: arg_count (u8)
+    /// 栈: [..., arg1, ..., argN] -> [..., result]
+    RecursiveCall = 208,
     
     // ============ 控制 ============
     /// 停止执行
@@ -528,8 +574,18 @@ impl From<u8> for OpCode {
             177 => OpCode::NewEnumFields,
             178 => OpCode::EnumVariantName,
             179 => OpCode::EnumGetValue,
-            180 => OpCode::EnumGetField,
-            181 => OpCode::EnumMatch,
+            185 => OpCode::EnumGetField,
+            186 => OpCode::EnumMatch,
+            // 超级指令
+            200 => OpCode::AddLocals,
+            201 => OpCode::SubLocals,
+            202 => OpCode::JumpIfLocalLeConst,
+            203 => OpCode::JumpIfLocalLtConst,
+            204 => OpCode::CallWithLocal,
+            205 => OpCode::ReturnLocal,
+            206 => OpCode::ReturnInt,
+            207 => OpCode::LoadLocals2,
+            208 => OpCode::RecursiveCall,
             255 => OpCode::Halt,
             _ => panic!("Unknown opcode: {}", value),
         }
@@ -808,6 +864,36 @@ impl Chunk {
         self.write(0xFF, line);
         self.write(0xFF, line);
         self.code.len() - 2
+    }
+    
+    /// 写入超级指令：两个局部变量相加（整数）
+    /// 操作数: slot1 (u8), slot2 (u8)
+    pub fn write_add_locals(&mut self, slot1: u8, slot2: u8, line: usize) {
+        self.write_op(OpCode::AddLocals, line);
+        self.write(slot1, line);
+        self.write(slot2, line);
+    }
+    
+    /// 写入超级指令：两个局部变量相减（整数）
+    /// 操作数: slot1 (u8), slot2 (u8)
+    pub fn write_sub_locals(&mut self, slot1: u8, slot2: u8, line: usize) {
+        self.write_op(OpCode::SubLocals, line);
+        self.write(slot1, line);
+        self.write(slot2, line);
+    }
+    
+    /// 写入超级指令：返回局部变量
+    /// 操作数: slot (u8)
+    pub fn write_return_local(&mut self, slot: u8, line: usize) {
+        self.write_op(OpCode::ReturnLocal, line);
+        self.write(slot, line);
+    }
+    
+    /// 写入超级指令：返回小整数常量
+    /// 操作数: value (i8)
+    pub fn write_return_int(&mut self, value: i8, line: usize) {
+        self.write_op(OpCode::ReturnInt, line);
+        self.write(value as u8, line);
     }
     
     /// 获取当前代码位置
