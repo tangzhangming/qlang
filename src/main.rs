@@ -9,6 +9,8 @@ mod parser;
 mod compiler;
 mod vm;
 mod types;
+mod package;
+mod stdlib;
 
 use std::env;
 use std::fs;

@@ -66,6 +66,8 @@ pub struct VM {
     locale: Locale,
     /// 当前栈基址（缓存，避免每次访问 frames.last()）
     current_base: usize,
+    /// 静态字段缓存 (类名::字段名 -> 值)
+    static_fields: std::collections::HashMap<String, Value>,
 }
 
 impl VM {
@@ -79,6 +81,7 @@ impl VM {
             exception_handlers: Vec::new(),
             locale,
             current_base: 0,
+            static_fields: std::collections::HashMap::new(),
         }
     }
 
@@ -1172,6 +1175,27 @@ impl VM {
                             return Err(self.runtime_error(&format!(
                                 "Class '{}' has no field '{}'",
                                 c.class_name, field_name
+                            )));
+                        }
+                    } else if let Some(e) = obj_val.as_enum() {
+                        // 枚举字段访问
+                        if field_name == "value" {
+                            // .value 属性：返回枚举关联值
+                            if let Some(ref val) = e.value {
+                                self.push(val.clone());
+                            } else {
+                                self.push(Value::null());
+                            }
+                        } else if field_name == "name" {
+                            // .name 属性：返回变体名
+                            self.push(Value::string(e.variant_name.clone()));
+                        } else if let Some(value) = e.associated_data.get(&field_name) {
+                            // 关联数据字段
+                            self.push(value.clone());
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Enum '{}::{}' has no field '{}'",
+                                e.enum_name, e.variant_name, field_name
                             )));
                         }
                     } else {
@@ -2512,11 +2536,122 @@ impl VM {
                         return Err(self.runtime_error("Invalid field name"));
                     };
                     
-                    // 这里简化处理，静态字段需要在运行时存储
-                    // 目前返回 null 作为占位符
-                    let _type_info = self.chunk.get_type(&class_name);
-                    self.push(Value::null());
-                    let _ = field_name; // 避免警告
+                    // 检查是否是枚举变体访问
+                    if let Some(enum_info) = self.chunk.get_enum(&class_name).cloned() {
+                        // 查找变体
+                        let variant = enum_info.variants.iter().find(|v| v.name == field_name);
+                        if let Some(variant) = variant {
+                            // 创建枚举实例
+                            let value = if let Some(value_idx) = variant.value_index {
+                                Some(self.chunk.constants[value_idx as usize].clone())
+                            } else {
+                                None
+                            };
+                            let enum_val = super::value::EnumVariantValue {
+                                enum_name: class_name.clone(),
+                                variant_name: variant.name.clone(),
+                                value,
+                                associated_data: std::collections::HashMap::new(),
+                            };
+                            self.push(Value::enum_val(Box::new(enum_val)));
+                            continue;
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Enum '{}' has no variant '{}'", class_name, field_name
+                            )));
+                        }
+                    }
+                    
+                    // 构造缓存键
+                    let cache_key = format!("{}::{}", class_name, field_name);
+                    
+                    // 检查缓存
+                    if let Some(value) = self.static_fields.get(&cache_key) {
+                        self.push(value.clone());
+                    } else {
+                        // 第一次访问，需要执行初始化函数
+                        if let Some(type_info) = self.chunk.get_type(&class_name) {
+                            if let Some(init_func_index) = type_info.static_fields.get(&field_name) {
+                                let init_func_index = *init_func_index as usize;
+                                // 获取初始化函数
+                                if let Some(func) = self.chunk.constants[init_func_index].as_function() {
+                                    // 保存当前状态
+                                    let saved_ip = self.ip;
+                                    let saved_base = self.current_base;
+                                    let saved_stack_len = self.stack.len();
+                                    
+                                    // 执行初始化函数
+                                    self.ip = func.chunk_index;
+                                    self.current_base = self.stack.len();
+                                    
+                                    // 创建一个临时调用帧
+                                    let frame = CallFrame {
+                                        return_ip: 0, // 不会使用
+                                        base_slot: self.current_base as u16,
+                                        is_method_call: false,
+                                    };
+                                    self.frames.push(frame);
+                                    
+                                    // 执行直到返回
+                                    let mut result_value: Option<Value> = None;
+                                    loop {
+                                        let op_byte = self.read_byte();
+                                        let op = OpCode::from(op_byte);
+                                        
+                                        match op {
+                                            OpCode::Return => {
+                                                let result = self.pop()?;
+                                                self.frames.pop();
+                                                
+                                                // 缓存结果
+                                                self.static_fields.insert(cache_key.clone(), result.clone());
+                                                result_value = Some(result);
+                                                
+                                                // 恢复状态
+                                                self.ip = saved_ip;
+                                                self.current_base = saved_base;
+                                                self.stack.truncate(saved_stack_len);
+                                                break;
+                                            }
+                                            OpCode::Const => {
+                                                let idx = self.read_u16() as usize;
+                                                let value = self.chunk.constants[idx].clone();
+                                                self.push(value);
+                                            }
+                                            OpCode::ConstInt8 => {
+                                                let value = self.read_byte() as i8 as i64;
+                                                self.push(Value::int(value));
+                                            }
+                                            _ => {
+                                                // 其他指令可能需要处理
+                                                return Err(self.runtime_error(&format!(
+                                                    "Unsupported opcode in static initializer: {:?}", op
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 在恢复栈后推送结果
+                                    if let Some(result) = result_value {
+                                        self.push(result);
+                                    }
+                                } else {
+                                    // 不是函数，直接使用常量值
+                                    let value = self.chunk.constants[init_func_index].clone();
+                                    self.static_fields.insert(cache_key, value.clone());
+                                    self.push(value);
+                                }
+                            } else {
+                                return Err(self.runtime_error(&format!(
+                                    "Unknown static field '{}.{}'", class_name, field_name
+                                )));
+                            }
+                        } else {
+                            return Err(self.runtime_error(&format!(
+                                "Unknown class '{}'", class_name
+                            )));
+                        }
+                    }
                 }
                 
                 OpCode::SetStatic => {
@@ -2541,6 +2676,69 @@ impl VM {
                     } else {
                         return Err(self.runtime_error("Invalid method name"));
                     };
+                    
+                    // 检查是否是枚举的内置方法
+                    if let Some(enum_info) = self.chunk.get_enum(&class_name).cloned() {
+                        if method_name == "fromValue" {
+                            // Enum.fromValue(value) - 根据值查找枚举变体
+                            if arg_count != 1 {
+                                return Err(self.runtime_error("fromValue() expects exactly 1 argument"));
+                            }
+                            let search_value = self.pop()?;
+                            
+                            // 遍历所有变体查找匹配的值
+                            let mut found = None;
+                            for variant in &enum_info.variants {
+                                if let Some(value_idx) = variant.value_index {
+                                    let variant_value = &self.chunk.constants[value_idx as usize];
+                                    if *variant_value == search_value {
+                                        // 创建枚举实例
+                                        let enum_val = super::value::EnumVariantValue {
+                                            enum_name: class_name.clone(),
+                                            variant_name: variant.name.clone(),
+                                            value: Some(search_value.clone()),
+                                            associated_data: std::collections::HashMap::new(),
+                                        };
+                                        found = Some(Value::enum_val(Box::new(enum_val)));
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if let Some(enum_val) = found {
+                                self.push(enum_val);
+                            } else {
+                                // 未找到匹配的值，返回 null
+                                self.push(Value::null());
+                            }
+                            continue;
+                        } else if method_name == "values" {
+                            // Enum.values() - 返回所有变体的数组
+                            let mut values = Vec::new();
+                            for variant in &enum_info.variants {
+                                let value = if let Some(value_idx) = variant.value_index {
+                                    Some(self.chunk.constants[value_idx as usize].clone())
+                                } else {
+                                    None
+                                };
+                                let enum_val = super::value::EnumVariantValue {
+                                    enum_name: class_name.clone(),
+                                    variant_name: variant.name.clone(),
+                                    value,
+                                    associated_data: std::collections::HashMap::new(),
+                                };
+                                values.push(Value::enum_val(Box::new(enum_val)));
+                            }
+                            
+                            // 弹出可能的参数（虽然 values() 不需要参数）
+                            for _ in 0..arg_count {
+                                self.pop()?;
+                            }
+                            
+                            self.push(Value::array(Rc::new(std::cell::RefCell::new(values))));
+                            continue;
+                        }
+                    }
                     
                     // 查找静态方法
                     let func_index = match self.chunk.get_static_method(&class_name, &method_name) {
@@ -2668,8 +2866,30 @@ impl VM {
                 }
                 
                 OpCode::Throw => {
+                    use crate::stdlib::exception::THROWABLE_TYPES;
+                    
                     // 弹出异常值
                     let exception = self.pop()?;
+                    
+                    // 检查抛出的值是否是 Throwable 类型
+                    let is_valid_throwable = if let Some(instance) = exception.as_class() {
+                        // 检查类实例是否是 Throwable 或其子类
+                        let class_name = &instance.borrow().class_name;
+                        self.is_throwable_class(class_name)
+                    } else if let Some(s) = exception.as_string() {
+                        // 检查字符串格式的异常（临时兼容）
+                        THROWABLE_TYPES.iter().any(|t| {
+                            s.starts_with(&format!("{}:", t)) || s == *t
+                        })
+                    } else {
+                        false
+                    };
+                    
+                    if !is_valid_throwable {
+                        return Err(self.runtime_error(
+                            "throw statement requires a Throwable instance"
+                        ));
+                    }
                     
                     // 查找最近的异常处理器
                     if let Some(handler) = self.exception_handlers.pop() {
@@ -2956,6 +3176,33 @@ impl VM {
     }
 
     /// 创建运行时错误
+    /// 检查类名是否是 Throwable 或其子类
+    fn is_throwable_class(&self, class_name: &str) -> bool {
+        use crate::stdlib::exception::THROWABLE_TYPES;
+        
+        // 检查类型注册表中的继承关系
+        let mut current = class_name.to_string();
+        loop {
+            // 检查当前类名是否在 Throwable 类型列表中
+            if THROWABLE_TYPES.contains(&current.as_str()) {
+                return true;
+            }
+            
+            // 查找父类
+            if let Some(type_info) = self.chunk.get_type(&current) {
+                if let Some(ref parent) = type_info.parent {
+                    current = parent.clone();
+                    continue;
+                }
+            }
+            
+            // 没有父类了，检查失败
+            break;
+        }
+        
+        false
+    }
+    
     fn runtime_error(&self, message: &str) -> RuntimeError {
         let line = self.chunk.get_line(self.ip.saturating_sub(1));
         RuntimeError::new(message.to_string(), line)
@@ -3712,27 +3959,27 @@ mod tests {
     #[test]
     fn test_closure_basic() {
         // 简单闭包定义和调用
-        assert!(run_code("var add = fn(a:int, b:int) int { return a + b }\nprintln(add(1, 2))").is_ok());
+        assert!(run_code("var add = func(a:int, b:int) int { return a + b }\nprintln(add(1, 2))").is_ok());
     }
     
     #[test]
     fn test_closure_no_params() {
         // 无参闭包
-        assert!(run_code("var greet = fn() string { return \"Hello\" }\nprintln(greet())").is_ok());
+        assert!(run_code("var greet = func() string { return \"Hello\" }\nprintln(greet())").is_ok());
     }
     
     #[test]
     fn test_closure_implicit_return() {
         // 隐式返回 null
-        assert!(run_code("var f = fn() { println(42) }\nf()").is_ok());
+        assert!(run_code("var f = func() { println(42) }\nf()").is_ok());
     }
     
     #[test]
     fn test_closure_nested_calls() {
         // 嵌套调用
         let code = r#"
-var double = fn(x:int) int { return x * 2 }
-var add_one = fn(x:int) int { return x + 1 }
+var double = func(x:int) int { return x * 2 }
+var add_one = func(x:int) int { return x + 1 }
 println(double(add_one(5)))
 "#;
         assert!(run_code(code).is_ok());

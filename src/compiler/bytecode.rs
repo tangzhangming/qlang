@@ -402,6 +402,8 @@ pub struct EnumVariantInfo {
     pub name: String,
     /// 关联数据字段名列表
     pub fields: Vec<String>,
+    /// 关联值（常量池索引，如 Ok = 200）
+    pub value_index: Option<u16>,
 }
 
 /// enum 类型信息
@@ -428,6 +430,8 @@ pub struct TypeInfo {
     pub fields: Vec<String>,
     /// 静态字段（字段名 -> 值在常量池中的索引）
     pub static_fields: std::collections::HashMap<String, u16>,
+    /// 静态常量字段（字段名集合，这些字段不能被修改）
+    pub const_fields: std::collections::HashSet<String>,
     /// 是否是 class（false 表示 struct）
     pub is_class: bool,
     /// 是否是抽象类
@@ -626,6 +630,7 @@ impl Chunk {
                 static_methods: std::collections::HashMap::new(),
                 fields: Vec::new(),
                 static_fields: std::collections::HashMap::new(),
+                const_fields: std::collections::HashSet::new(),
                 is_class: false,
                 is_abstract: false,
                 abstract_methods: Vec::new(),
@@ -648,6 +653,7 @@ impl Chunk {
                 static_methods: std::collections::HashMap::new(),
                 fields: Vec::new(),
                 static_fields: std::collections::HashMap::new(),
+                const_fields: std::collections::HashSet::new(),
                 is_class: true,
                 is_abstract,
                 abstract_methods: Vec::new(),
@@ -725,6 +731,23 @@ impl Chunk {
     pub fn register_static_field(&mut self, type_name: &str, field_name: String, value_index: u16) {
         if let Some(type_info) = self.types.get_mut(type_name) {
             type_info.static_fields.insert(field_name, value_index);
+        }
+    }
+    
+    /// 注册静态常量字段
+    pub fn register_static_const(&mut self, type_name: &str, field_name: String, value_index: u16) {
+        if let Some(type_info) = self.types.get_mut(type_name) {
+            type_info.static_fields.insert(field_name.clone(), value_index);
+            type_info.const_fields.insert(field_name);
+        }
+    }
+    
+    /// 检查静态字段是否是常量
+    pub fn is_static_const(&self, type_name: &str, field_name: &str) -> bool {
+        if let Some(type_info) = self.types.get(type_name) {
+            type_info.const_fields.contains(field_name)
+        } else {
+            false
         }
     }
     

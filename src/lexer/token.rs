@@ -30,8 +30,8 @@ pub enum TokenKind {
     Var,
     /// const
     Const,
-    /// fn
-    Fn,
+    /// func
+    Func,
     /// struct
     Struct,
     /// class
@@ -48,12 +48,14 @@ pub enum TokenKind {
     Type,
 
     // ============ 可见性关键字 ============
-    /// pub
-    Pub,
-    /// priv
-    Priv,
-    /// prot
-    Prot,
+    /// public（默认可见性）
+    Public,
+    /// internal（模块内可见）
+    Internal,
+    /// private（仅当前文件/类可见）
+    Private,
+    /// protected（当前类和子类可见）
+    Protected,
 
     // ============ 类型关键字 ============
     /// int
@@ -381,7 +383,7 @@ impl fmt::Display for TokenKind {
             // 声明关键字
             TokenKind::Var => write!(f, "var"),
             TokenKind::Const => write!(f, "const"),
-            TokenKind::Fn => write!(f, "fn"),
+            TokenKind::Func => write!(f, "func"),
             TokenKind::Struct => write!(f, "struct"),
             TokenKind::Class => write!(f, "class"),
             TokenKind::Interface => write!(f, "interface"),
@@ -391,9 +393,10 @@ impl fmt::Display for TokenKind {
             TokenKind::Type => write!(f, "type"),
             
             // 可见性关键字
-            TokenKind::Pub => write!(f, "pub"),
-            TokenKind::Priv => write!(f, "priv"),
-            TokenKind::Prot => write!(f, "prot"),
+            TokenKind::Public => write!(f, "public"),
+            TokenKind::Internal => write!(f, "internal"),
+            TokenKind::Private => write!(f, "private"),
+            TokenKind::Protected => write!(f, "protected"),
             
             // 类型关键字
             TokenKind::Int => write!(f, "int"),

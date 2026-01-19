@@ -486,7 +486,7 @@ impl Scanner {
             // 声明关键字
             "var" => TokenKind::Var,
             "const" => TokenKind::Const,
-            "fn" => TokenKind::Fn,
+            "func" => TokenKind::Func,
             "struct" => TokenKind::Struct,
             "class" => TokenKind::Class,
             "interface" => TokenKind::Interface,
@@ -496,9 +496,10 @@ impl Scanner {
             "type" => TokenKind::Type,
             
             // 可见性关键字
-            "pub" => TokenKind::Pub,
-            "priv" => TokenKind::Priv,
-            "prot" => TokenKind::Prot,
+            "public" => TokenKind::Public,
+            "internal" => TokenKind::Internal,
+            "private" => TokenKind::Private,
+            "protected" => TokenKind::Protected,
             
             // 类型关键字
             "int" => TokenKind::Int,
@@ -675,12 +676,12 @@ mod tests {
     
     #[test]
     fn test_scan_keywords() {
-        let mut scanner = Scanner::new("var const fn if else for return true false null");
+        let mut scanner = Scanner::new("var const func if else for return true false null");
         let tokens = scanner.scan_tokens();
         
         assert!(matches!(tokens[0].kind, TokenKind::Var));
         assert!(matches!(tokens[1].kind, TokenKind::Const));
-        assert!(matches!(tokens[2].kind, TokenKind::Fn));
+        assert!(matches!(tokens[2].kind, TokenKind::Func));
         assert!(matches!(tokens[3].kind, TokenKind::If));
         assert!(matches!(tokens[4].kind, TokenKind::Else));
         assert!(matches!(tokens[5].kind, TokenKind::For));

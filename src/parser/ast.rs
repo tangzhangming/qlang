@@ -104,6 +104,17 @@ pub struct TypeAnnotation {
     pub span: Span,
 }
 
+/// 泛型类型参数（如 T、K、V）
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    /// 参数名（如 T）
+    pub name: String,
+    /// 约束（如 T: Comparable，暂未实现）
+    pub bounds: Vec<String>,
+    /// 位置信息
+    pub span: Span,
+}
+
 /// 字符串插值的组成部分
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringInterpPart {
@@ -316,6 +327,17 @@ pub enum Expr {
     Super {
         span: Span,
     },
+    /// default 关键字（默认初始化）
+    Default {
+        type_name: String,
+        span: Span,
+    },
+    /// 静态成员访问 ClassName::member
+    StaticMember {
+        class_name: String,
+        member: String,
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -349,6 +371,8 @@ impl Expr {
             Expr::New { span, .. } => *span,
             Expr::This { span } => *span,
             Expr::Super { span } => *span,
+            Expr::Default { span, .. } => *span,
+            Expr::StaticMember { span, .. } => *span,
             Expr::IfExpr { span, .. } => *span,
             Expr::Array { span, .. } => *span,
             Expr::MapLiteral { span, .. } => *span,
@@ -454,6 +478,10 @@ pub enum Stmt {
     /// struct 定义
     StructDef {
         name: String,
+        /// 泛型类型参数（如 struct Pair<K, V>）
+        type_params: Vec<TypeParam>,
+        /// 实现的接口列表
+        interfaces: Vec<String>,
         fields: Vec<StructField>,
         methods: Vec<StructMethod>,
         span: Span,
@@ -461,6 +489,8 @@ pub enum Stmt {
     /// class 定义
     ClassDef {
         name: String,
+        /// 泛型类型参数（如 class List<T>）
+        type_params: Vec<TypeParam>,
         /// 是否是抽象类
         is_abstract: bool,
         parent: Option<String>,
@@ -480,6 +510,8 @@ pub enum Stmt {
     /// trait 定义
     TraitDef {
         name: String,
+        /// 泛型类型参数（如 trait Comparable<T>）
+        type_params: Vec<TypeParam>,
         methods: Vec<TraitMethod>,
         span: Span,
     },
@@ -508,14 +540,48 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
-    /// 命名函数定义
+    /// 命名函数定义（包级函数）
     FnDef {
         name: String,
+        /// 泛型类型参数（如 func map<T, U>(...)）
+        type_params: Vec<TypeParam>,
         params: Vec<FnParam>,
         return_type: Option<TypeAnnotation>,
         body: Box<Stmt>,
+        visibility: Visibility,
         span: Span,
     },
+    /// 包声明（必须是文件第一条非注释语句）
+    Package {
+        /// 包路径，如 "com.example.demo"
+        path: String,
+        span: Span,
+    },
+    /// 导入声明
+    Import {
+        import: ImportDecl,
+        span: Span,
+    },
+}
+
+/// 导入声明
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDecl {
+    /// 导入路径（不含最后部分），如 "com.example.models"
+    pub path: String,
+    /// 导入的目标
+    pub target: ImportTarget,
+}
+
+/// 导入目标类型
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportTarget {
+    /// 导入所有公开成员：import com.example.services.*
+    All,
+    /// 导入指定成员：import com.example.models.UserModel
+    Single(String),
+    /// 导入多个成员：import com.example.models.{User, Product}
+    Multiple(Vec<String>),
 }
 
 /// match 分支
@@ -555,20 +621,23 @@ pub enum MatchPattern {
     },
 }
 
-/// 可见性修饰符
+/// 可见性修饰符（Kotlin 风格）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
-    /// 公开 (pub)
+    /// 公开 (public) - 默认可见性，任何地方都可以访问
     Public,
-    /// 私有 (priv)
+    /// 模块内可见 (internal) - 同一模块内可见
+    Internal,
+    /// 私有 (private) - 仅当前文件/类可见
     Private,
-    /// 保护 (prot)
+    /// 保护 (protected) - 当前类和子类可见
     Protected,
 }
 
 impl Default for Visibility {
     fn default() -> Self {
-        Visibility::Private
+        // Kotlin 风格：默认为 public
+        Visibility::Public
     }
 }
 
@@ -600,6 +669,8 @@ pub struct ClassField {
     pub initializer: Option<Expr>,
     pub visibility: Visibility,
     pub is_static: bool,
+    /// 是否是常量（static const）
+    pub is_const: bool,
     pub span: Span,
 }
 
@@ -674,6 +745,8 @@ impl Stmt {
             Stmt::TryCatch { span, .. } => *span,
             Stmt::Throw { span, .. } => *span,
             Stmt::FnDef { span, .. } => *span,
+            Stmt::Package { span, .. } => *span,
+            Stmt::Import { span, .. } => *span,
         }
     }
 }
@@ -681,6 +754,10 @@ impl Stmt {
 /// 程序（AST 根节点）
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    /// 包声明（可选）
+    pub package: Option<String>,
+    /// 导入声明列表
+    pub imports: Vec<ImportDecl>,
     /// 语句列表
     pub statements: Vec<Stmt>,
 }
@@ -688,6 +765,19 @@ pub struct Program {
 impl Program {
     /// 创建新的程序
     pub fn new(statements: Vec<Stmt>) -> Self {
-        Self { statements }
+        Self { 
+            package: None,
+            imports: Vec::new(),
+            statements,
+        }
+    }
+    
+    /// 创建带包声明和导入的程序
+    pub fn with_package_and_imports(
+        package: Option<String>,
+        imports: Vec<ImportDecl>,
+        statements: Vec<Stmt>,
+    ) -> Self {
+        Self { package, imports, statements }
     }
 }

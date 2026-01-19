@@ -4,7 +4,7 @@
 
 use crate::lexer::{Token, TokenKind, Span};
 use crate::i18n::{Locale, format_message, messages};
-use super::ast::{Expr, Stmt, Program, BinOp, UnaryOp, AssignOp, TypeAnnotation, FnParam};
+use super::ast::{Expr, Stmt, Program, BinOp, UnaryOp, AssignOp, TypeAnnotation, FnParam, ImportDecl, ImportTarget};
 use crate::types::Type;
 
 /// 运算符优先级
@@ -62,8 +62,49 @@ impl Parser {
 
     /// 解析程序
     pub fn parse(&mut self) -> Result<Program, Vec<ParseError>> {
+        let mut package: Option<String> = None;
+        let mut imports: Vec<ImportDecl> = Vec::new();
         let mut statements = Vec::new();
         
+        // 跳过开头的空行
+        while self.check(&TokenKind::Newline) {
+            self.advance();
+        }
+        
+        // 解析可选的包声明（必须在文件开头）
+        if self.check(&TokenKind::Package) {
+            match self.parse_package_declaration() {
+                Ok(pkg) => package = Some(pkg),
+                Err(e) => self.errors.push(e),
+            }
+        }
+        
+        // 解析所有 import 声明
+        loop {
+            // 跳过空行
+            while self.check(&TokenKind::Newline) {
+                self.advance();
+            }
+            
+            if self.is_at_end() {
+                break;
+            }
+            
+            // 检查是否是 import
+            if self.check(&TokenKind::Import) {
+                match self.parse_import_declaration() {
+                    Ok(import) => imports.push(import),
+                    Err(e) => {
+                        self.errors.push(e);
+                        self.synchronize();
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        
+        // 解析其余语句
         while !self.is_at_end() {
             // 跳过空行
             while self.check(&TokenKind::Newline) {
@@ -84,10 +125,136 @@ impl Parser {
         }
         
         if self.errors.is_empty() {
-            Ok(Program::new(statements))
+            Ok(Program::with_package_and_imports(package, imports, statements))
         } else {
             Err(self.errors.clone())
         }
+    }
+    
+    /// 解析包声明
+    /// package com.example.demo
+    fn parse_package_declaration(&mut self) -> Result<String, ParseError> {
+        self.advance(); // 消费 'package'
+        
+        // 解析包路径
+        let path = self.parse_dotted_name()?;
+        
+        // 可选的换行或分号
+        if self.check(&TokenKind::Newline) || self.check(&TokenKind::Semicolon) {
+            self.advance();
+        }
+        
+        Ok(path)
+    }
+    
+    /// 解析导入声明
+    /// import com.example.services.*
+    /// import com.example.models.UserModel
+    /// import com.example.models.{User, Product}
+    fn parse_import_declaration(&mut self) -> Result<ImportDecl, ParseError> {
+        self.advance(); // 消费 'import'
+        
+        // 解析导入路径（点分隔）
+        let mut parts = Vec::new();
+        parts.push(self.expect_identifier()?);
+        
+        while self.check(&TokenKind::Dot) {
+            self.advance(); // 消费 '.'
+            
+            // 检查是否是通配符 *
+            if self.check(&TokenKind::Star) {
+                self.advance();
+                // 可选的换行或分号
+                if self.check(&TokenKind::Newline) || self.check(&TokenKind::Semicolon) {
+                    self.advance();
+                }
+                return Ok(ImportDecl {
+                    path: parts.join("."),
+                    target: ImportTarget::All,
+                });
+            }
+            
+            // 检查是否是多成员导入 { A, B, C }
+            if self.check(&TokenKind::LeftBrace) {
+                self.advance(); // 消费 '{'
+                let mut members = Vec::new();
+                
+                // 跳过换行
+                while self.check(&TokenKind::Newline) {
+                    self.advance();
+                }
+                
+                if !self.check(&TokenKind::RightBrace) {
+                    members.push(self.expect_identifier()?);
+                    
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        // 跳过换行
+                        while self.check(&TokenKind::Newline) {
+                            self.advance();
+                        }
+                        if self.check(&TokenKind::RightBrace) {
+                            break; // 允许末尾逗号
+                        }
+                        members.push(self.expect_identifier()?);
+                    }
+                }
+                
+                // 跳过换行
+                while self.check(&TokenKind::Newline) {
+                    self.advance();
+                }
+                
+                self.expect(&TokenKind::RightBrace)?;
+                
+                // 可选的换行或分号
+                if self.check(&TokenKind::Newline) || self.check(&TokenKind::Semicolon) {
+                    self.advance();
+                }
+                
+                return Ok(ImportDecl {
+                    path: parts.join("."),
+                    target: ImportTarget::Multiple(members),
+                });
+            }
+            
+            // 普通标识符
+            parts.push(self.expect_identifier()?);
+        }
+        
+        // 单个成员导入：最后一个部分是成员名
+        if parts.len() < 2 {
+            return Err(ParseError::new(
+                "Import path must have at least two parts".to_string(),
+                self.current_span(),
+            ));
+        }
+        
+        let member = parts.pop().unwrap();
+        let path = parts.join(".");
+        
+        // 可选的换行或分号
+        if self.check(&TokenKind::Newline) || self.check(&TokenKind::Semicolon) {
+            self.advance();
+        }
+        
+        Ok(ImportDecl {
+            path,
+            target: ImportTarget::Single(member),
+        })
+    }
+    
+    /// 解析点分隔的名称，如 com.example.demo
+    fn parse_dotted_name(&mut self) -> Result<String, ParseError> {
+        let mut parts = Vec::new();
+        parts.push(self.expect_identifier()?);
+        
+        while self.check(&TokenKind::Dot) {
+            self.advance();
+            parts.push(self.expect_identifier()?);
+        }
+        
+        Ok(parts.join("."))
     }
 
     /// 解析语句
@@ -197,9 +364,28 @@ impl Parser {
             return self.parse_type_alias();
         }
         
-        // 检查命名函数定义 fn name(params) return_type { }
-        if self.check(&TokenKind::Fn) {
-            return self.parse_named_function();
+        // 检查可见性修饰符 + 函数定义
+        let visibility = if self.check(&TokenKind::Public) || self.check(&TokenKind::Internal) 
+                           || self.check(&TokenKind::Private) || self.check(&TokenKind::Protected) {
+            let vis = self.parse_visibility();
+            // 可见性后面必须跟 func
+            if !self.check(&TokenKind::Func) {
+                return Err(ParseError::new(
+                    format!("Visibility modifier must be followed by 'func' keyword"),
+                    self.current_span(),
+                ));
+            }
+            vis
+        } else if self.check(&TokenKind::Func) {
+            super::ast::Visibility::default()
+        } else {
+            // 不是函数定义，继续其他检查
+            super::ast::Visibility::default()
+        };
+        
+        // 检查命名函数定义 func name(params) return_type { }
+        if self.check(&TokenKind::Func) {
+            return self.parse_named_function_with_visibility(visibility);
         }
         
         // 检查 match 语句
@@ -272,7 +458,31 @@ impl Parser {
         // 可选的初始化表达式
         let initializer = if self.check(&TokenKind::Equal) {
             self.advance();
-            Some(self.parse_expression()?)
+            // 检查是否是 default 初始化
+            if self.check(&TokenKind::Default) {
+                let default_span = self.current_span();
+                self.advance();
+                // default 初始化需要类型注解
+                if let Some(ref ta) = type_ann {
+                    // 从类型注解中获取类型名
+                    let type_name = match &ta.ty {
+                        crate::types::Type::Class(name) => name.clone(),
+                        _ => {
+                            let msg = "'default' can only be used with class/struct types".to_string();
+                            return Err(ParseError::new(msg, default_span));
+                        }
+                    };
+                    Some(Expr::Default { 
+                        type_name, 
+                        span: default_span 
+                    })
+                } else {
+                    let msg = "'default' initialization requires type annotation".to_string();
+                    return Err(ParseError::new(msg, default_span));
+                }
+            } else {
+                Some(self.parse_expression()?)
+            }
         } else {
             None
         };
@@ -491,6 +701,20 @@ impl Parser {
         // 结构体名称
         let name = self.expect_identifier()?;
         
+        // 解析可选的泛型类型参数 <T, K, V>
+        let type_params = self.parse_type_params()?;
+        
+        // 解析可选的 implements 子句
+        let mut interfaces = Vec::new();
+        if self.check(&TokenKind::Implements) {
+            self.advance();
+            interfaces.push(self.expect_identifier()?);
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                interfaces.push(self.expect_identifier()?);
+            }
+        }
+        
         // 期望 '{'
         self.expect(&TokenKind::LeftBrace)?;
         
@@ -511,8 +735,8 @@ impl Parser {
             // 检查可见性修饰符
             let visibility = self.parse_visibility();
             
-            // 检查是否是方法（fn 关键字）
-            if self.check(&TokenKind::Fn) {
+            // 检查是否是方法（func 关键字）
+            if self.check(&TokenKind::Func) {
                 let method = self.parse_struct_method(visibility)?;
                 methods.push(method);
             } else {
@@ -528,25 +752,91 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::StructDef { name, fields, methods, span })
+        Ok(Stmt::StructDef { name, type_params, interfaces, fields, methods, span })
     }
     
-    /// 解析可见性修饰符
+    /// 解析可见性修饰符（Kotlin 风格，默认为 public）
     fn parse_visibility(&mut self) -> super::ast::Visibility {
         use super::ast::Visibility;
         
-        if self.check(&TokenKind::Pub) {
+        if self.check(&TokenKind::Public) {
             self.advance();
             Visibility::Public
-        } else if self.check(&TokenKind::Priv) {
+        } else if self.check(&TokenKind::Internal) {
+            self.advance();
+            Visibility::Internal
+        } else if self.check(&TokenKind::Private) {
             self.advance();
             Visibility::Private
-        } else if self.check(&TokenKind::Prot) {
+        } else if self.check(&TokenKind::Protected) {
             self.advance();
             Visibility::Protected
         } else {
+            // 默认为 public（Kotlin 风格）
             Visibility::default()
         }
+    }
+    
+    /// 解析泛型类型参数列表 <T, K, V>
+    fn parse_type_params(&mut self) -> Result<Vec<super::ast::TypeParam>, ParseError> {
+        use super::ast::TypeParam;
+        
+        let mut params = Vec::new();
+        
+        // 检查是否有 '<'
+        if !self.check(&TokenKind::Less) {
+            return Ok(params);
+        }
+        
+        self.advance(); // 消费 '<'
+        
+        // 跳过空行
+        while self.check(&TokenKind::Newline) {
+            self.advance();
+        }
+        
+        // 解析第一个类型参数
+        if !self.check(&TokenKind::Greater) {
+            let param_span = self.current_span();
+            let param_name = self.expect_identifier()?;
+            
+            // TODO: 解析约束 (如 T: Comparable)
+            let bounds = Vec::new();
+            
+            params.push(TypeParam {
+                name: param_name,
+                bounds,
+                span: param_span,
+            });
+            
+            // 解析更多参数
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                
+                // 跳过空行
+                while self.check(&TokenKind::Newline) {
+                    self.advance();
+                }
+                
+                if self.check(&TokenKind::Greater) {
+                    break; // 允许末尾逗号
+                }
+                
+                let param_span = self.current_span();
+                let param_name = self.expect_identifier()?;
+                
+                params.push(TypeParam {
+                    name: param_name,
+                    bounds: Vec::new(),
+                    span: param_span,
+                });
+            }
+        }
+        
+        // 期望 '>'
+        self.expect(&TokenKind::Greater)?;
+        
+        Ok(params)
     }
     
     /// 解析 struct 字段
@@ -576,7 +866,7 @@ impl Parser {
     /// 解析 struct 方法
     fn parse_struct_method(&mut self, visibility: super::ast::Visibility) -> Result<super::ast::StructMethod, ParseError> {
         let start_span = self.current_span();
-        self.advance(); // 消费 'fn'
+        self.advance(); // 消费 'func'
         
         // 方法名
         let name = self.expect_identifier()?;
@@ -609,6 +899,9 @@ impl Parser {
         
         // 类名
         let name = self.expect_identifier()?;
+        
+        // 解析可选的泛型类型参数 <T, K, V>
+        let type_params = self.parse_type_params()?;
         
         // 可选的父类
         let parent = if self.check(&TokenKind::Extends) {
@@ -670,6 +963,18 @@ impl Parser {
                 false
             };
             
+            // 检查 const (用于 static const 字段)
+            let is_const = if self.check(&TokenKind::Const) {
+                if !is_static {
+                    let msg = "'const' can only be used with 'static' (use 'static const')".to_string();
+                    return Err(ParseError::new(msg, self.current_span()));
+                }
+                self.advance();
+                true
+            } else {
+                false
+            };
+            
             // 检查 override
             let is_override = if self.check(&TokenKind::Override) {
                 self.advance();
@@ -690,13 +995,13 @@ impl Parser {
                 false
             };
             
-            // 检查是否是方法（fn 关键字，包括构造函数 fn init()）
-            if self.check(&TokenKind::Fn) {
+            // 检查是否是方法（func 关键字，包括构造函数 func init()）
+            if self.check(&TokenKind::Func) {
                 let method = self.parse_class_method(visibility, is_static, is_override, is_method_abstract)?;
                 methods.push(method);
             } else {
                 // 解析字段
-                let field = self.parse_class_field(visibility, is_static)?;
+                let field = self.parse_class_field(visibility, is_static, is_const)?;
                 fields.push(field);
             }
         }
@@ -707,11 +1012,11 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::ClassDef { name, is_abstract, parent, interfaces, traits, fields, methods, span })
+        Ok(Stmt::ClassDef { name, type_params, is_abstract, parent, interfaces, traits, fields, methods, span })
     }
     
     /// 解析 class 字段
-    fn parse_class_field(&mut self, visibility: super::ast::Visibility, is_static: bool) -> Result<super::ast::ClassField, ParseError> {
+    fn parse_class_field(&mut self, visibility: super::ast::Visibility, is_static: bool, is_const: bool) -> Result<super::ast::ClassField, ParseError> {
         let start_span = self.current_span();
         
         // 字段名
@@ -733,6 +1038,12 @@ impl Parser {
             None
         };
         
+        // const 字段必须有初始值
+        if is_const && initializer.is_none() {
+            let msg = "Const field must be initialized".to_string();
+            return Err(ParseError::new(msg, start_span));
+        }
+        
         // 可选的换行或分号
         if self.check(&TokenKind::Newline) || self.check(&TokenKind::Semicolon) {
             self.advance();
@@ -741,19 +1052,19 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(super::ast::ClassField { name, type_ann, initializer, visibility, is_static, span })
+        Ok(super::ast::ClassField { name, type_ann, initializer, visibility, is_static, is_const, span })
     }
     
     /// 解析 class 方法
     fn parse_class_method(&mut self, visibility: super::ast::Visibility, is_static: bool, is_override: bool, is_abstract: bool) -> Result<super::ast::ClassMethod, ParseError> {
         let start_span = self.current_span();
         
-        // 必须有 fn 关键字
-        if !self.check(&TokenKind::Fn) {
-            let msg = "Expected 'fn' keyword".to_string();
+        // 必须有 func 关键字
+        if !self.check(&TokenKind::Func) {
+            let msg = "Expected 'func' keyword".to_string();
             return Err(ParseError::new(msg, self.current_span()));
         }
-        self.advance(); // 消费 'fn'
+        self.advance(); // 消费 'func'
         
         // 方法名（包括 init 构造函数）
         let name = self.expect_identifier()?;
@@ -835,8 +1146,8 @@ impl Parser {
     fn parse_interface_method(&mut self) -> Result<super::ast::InterfaceMethod, ParseError> {
         let start_span = self.current_span();
         
-        // 期望 'fn'
-        self.expect(&TokenKind::Fn)?;
+        // 期望 'func'
+        self.expect(&TokenKind::Func)?;
         
         // 方法名
         let name = self.expect_identifier()?;
@@ -872,6 +1183,9 @@ impl Parser {
         // trait 名称
         let name = self.expect_identifier()?;
         
+        // 解析可选的泛型类型参数 <T, K, V>
+        let type_params = self.parse_type_params()?;
+        
         // 期望 '{'
         self.expect(&TokenKind::LeftBrace)?;
         
@@ -903,15 +1217,15 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::TraitDef { name, methods, span })
+        Ok(Stmt::TraitDef { name, type_params, methods, span })
     }
     
     /// 解析 trait 方法（可能有默认实现）
     fn parse_trait_method(&mut self) -> Result<super::ast::TraitMethod, ParseError> {
         let start_span = self.current_span();
         
-        // 期望 'fn'
-        self.expect(&TokenKind::Fn)?;
+        // 期望 'func'
+        self.expect(&TokenKind::Func)?;
         
         // 方法名
         let name = self.expect_identifier()?;
@@ -1548,7 +1862,10 @@ impl Parser {
             
             // 标识符、函数调用或 struct 字面量
             TokenKind::Identifier(name) => {
-                if self.check(&TokenKind::LeftParen) {
+                if self.check(&TokenKind::ColonColon) {
+                    // 静态访问: ClassName::member 或 ClassName::method()
+                    self.parse_static_access(name.clone(), token.span)
+                } else if self.check(&TokenKind::LeftParen) {
                     // 函数调用
                     self.parse_call(name.clone(), token.span)
                 } else if self.check(&TokenKind::LeftBrace) {
@@ -1606,8 +1923,8 @@ impl Parser {
                 })
             }
             
-            // 闭包表达式 fn(params) returnType { body }
-            TokenKind::Fn => {
+            // 闭包表达式 func(params) returnType { body }
+            TokenKind::Func => {
                 self.parse_closure(token.span)
             }
             
@@ -2016,6 +2333,57 @@ impl Parser {
         })
     }
 
+    /// 解析静态访问 ClassName::member 或 ClassName::method()
+    fn parse_static_access(&mut self, class_name: String, start_span: Span) -> Result<Expr, ParseError> {
+        self.advance(); // 消费 '::'
+        
+        // 获取成员名
+        let member = self.expect_identifier()?;
+        
+        // 检查是否是静态方法调用
+        if self.check(&TokenKind::LeftParen) {
+            // 静态方法调用: ClassName::method(args)
+            self.advance(); // 消费 '('
+            
+            let mut args = Vec::new();
+            
+            if !self.check(&TokenKind::RightParen) {
+                loop {
+                    args.push(self.parse_expression()?);
+                    
+                    if !self.check(&TokenKind::Comma) {
+                        break;
+                    }
+                    self.advance(); // 消费 ','
+                }
+            }
+            
+            self.expect(&TokenKind::RightParen)?;
+            let end_span = self.previous_span();
+            
+            // 静态方法调用表示为 Call，其 callee 是 StaticMember
+            let callee = Box::new(Expr::StaticMember {
+                class_name,
+                member,
+                span: start_span,
+            });
+            
+            Ok(Expr::Call {
+                callee,
+                args,
+                span: Span::new(start_span.start, end_span.end, start_span.line, start_span.column),
+            })
+        } else {
+            // 静态字段访问: ClassName::CONST
+            let end_span = self.previous_span();
+            Ok(Expr::StaticMember {
+                class_name,
+                member,
+                span: Span::new(start_span.start, end_span.end, start_span.line, start_span.column),
+            })
+        }
+    }
+
     /// 解析函数调用
     fn parse_call(&mut self, callee_name: String, start_span: Span) -> Result<Expr, ParseError> {
         // 创建 callee 表达式
@@ -2105,13 +2473,16 @@ impl Parser {
     }
 
     /// 解析命名函数定义
-    /// fn name(params) return_type { body }
-    fn parse_named_function(&mut self) -> Result<Stmt, ParseError> {
+    /// func name(params) return_type { body }
+    fn parse_named_function_with_visibility(&mut self, visibility: super::ast::Visibility) -> Result<Stmt, ParseError> {
         let start_span = self.current_span();
-        self.advance(); // 消费 'fn'
+        self.advance(); // 消费 'func'
         
         // 函数名
         let name = self.expect_identifier()?;
+        
+        // 解析可选的泛型类型参数 <T, U>
+        let type_params = self.parse_type_params()?;
         
         // 参数列表
         self.expect(&TokenKind::LeftParen)?;
@@ -2131,7 +2502,7 @@ impl Parser {
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
-        Ok(Stmt::FnDef { name, params, return_type, body, span })
+        Ok(Stmt::FnDef { name, type_params, params, return_type, body, visibility, span })
     }
     
     /// 解析闭包表达式
@@ -2586,7 +2957,7 @@ mod tests {
     #[test]
     fn test_parse_closure() {
         // 无参数无返回值
-        let program = parse("var f = fn() { println(42) }").unwrap();
+        let program = parse("var f = func() { println(42) }").unwrap();
         assert_eq!(program.statements.len(), 1);
         if let Stmt::VarDecl { initializer: Some(expr), .. } = &program.statements[0] {
             assert!(matches!(expr, Expr::Closure { .. }));
@@ -2595,7 +2966,7 @@ mod tests {
         }
         
         // 带参数和返回类型
-        let program = parse("var add = fn(a:int, b:int) int { return a + b }").unwrap();
+        let program = parse("var add = func(a:int, b:int) int { return a + b }").unwrap();
         assert_eq!(program.statements.len(), 1);
         if let Stmt::VarDecl { initializer: Some(Expr::Closure { params, return_type, .. }), .. } = &program.statements[0] {
             assert_eq!(params.len(), 2);

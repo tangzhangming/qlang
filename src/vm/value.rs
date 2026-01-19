@@ -229,7 +229,8 @@ pub struct HeapClass {
 pub struct EnumVariantValue {
     pub enum_name: String,
     pub variant_name: String,
-    pub associated_data: HashMap<String, Value>,
+    pub value: Option<Value>,  // 关联值（如 Ok = 200 中的 200）
+    pub associated_data: HashMap<String, Value>,  // 关联数据字段
 }
 
 /// 堆上的 Enum

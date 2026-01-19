@@ -722,16 +722,40 @@ impl Compiler {
                     self.chunk.write_op(OpCode::Pop, span.line);
                 }
             }
-            Stmt::StructDef { name, fields: _, methods, span } => {
+            Stmt::StructDef { name, type_params: _, interfaces, fields: _, methods, span } => {
                 // 注册 struct 类型
                 self.chunk.register_type(name.clone());
+                
+                // 收集已定义的方法名
+                let defined_methods: std::collections::HashSet<String> = methods.iter()
+                    .map(|m| m.name.clone())
+                    .collect();
+                
+                // 检查接口实现
+                for interface_name in interfaces {
+                    if let Some(interface_info) = self.chunk.get_interface(interface_name).cloned() {
+                        // 检查 struct 是否实现了接口的所有方法
+                        for interface_method in &interface_info.methods {
+                            if !defined_methods.contains(&interface_method.name) {
+                                let msg = format!(
+                                    "Struct '{}' does not implement method '{}' required by interface '{}'",
+                                    name, interface_method.name, interface_name
+                                );
+                                self.errors.push(CompileError::new(msg, *span));
+                            }
+                        }
+                    } else {
+                        let msg = format!("Unknown interface '{}'", interface_name);
+                        self.errors.push(CompileError::new(msg, *span));
+                    }
+                }
                 
                 // 编译每个方法
                 for method in methods {
                     self.compile_struct_method(name, method, *span);
                 }
             }
-            Stmt::ClassDef { name, is_abstract, parent, interfaces: _, traits, fields, methods, span } => {
+            Stmt::ClassDef { name, type_params: _, is_abstract, parent, interfaces, traits, fields, methods, span } => {
                 // 注册 class 类型（包括是否抽象）
                 self.chunk.register_class_with_abstract(name.clone(), parent.clone(), *is_abstract);
                 
@@ -740,17 +764,47 @@ impl Compiler {
                     .map(|m| m.name.clone())
                     .collect();
                 
-                // 处理 traits：将 trait 的默认方法复制到 class 中
+                // 检查接口实现
+                for interface_name in interfaces {
+                    if let Some(interface_info) = self.chunk.get_interface(interface_name).cloned() {
+                        // 检查类是否实现了接口的所有方法
+                        for interface_method in &interface_info.methods {
+                            if !defined_methods.contains(&interface_method.name) {
+                                let msg = format!(
+                                    "Class '{}' does not implement method '{}' required by interface '{}'",
+                                    name, interface_method.name, interface_name
+                                );
+                                self.errors.push(CompileError::new(msg, *span));
+                            }
+                        }
+                    } else {
+                        let msg = format!("Unknown interface '{}'", interface_name);
+                        self.errors.push(CompileError::new(msg, *span));
+                    }
+                }
+                
+                // 处理 traits：检查并将 trait 的默认方法复制到 class 中
                 for trait_name in traits {
                     if let Some(trait_info) = self.chunk.get_trait(trait_name).cloned() {
                         for trait_method in &trait_info.methods {
-                            // 如果类没有定义该方法，且 trait 有默认实现，则使用默认实现
                             if !defined_methods.contains(&trait_method.name) {
+                                // 如果类没有定义该方法
                                 if let Some(func_index) = trait_method.default_impl {
+                                    // trait 有默认实现，使用默认实现
                                     self.chunk.register_method(name, trait_method.name.clone(), func_index);
+                                } else {
+                                    // trait 没有默认实现，且类没有实现该方法，报错
+                                    let msg = format!(
+                                        "Class '{}' does not implement method '{}' required by trait '{}'",
+                                        name, trait_method.name, trait_name
+                                    );
+                                    self.errors.push(CompileError::new(msg, *span));
                                 }
                             }
                         }
+                    } else {
+                        let msg = format!("Unknown trait '{}'", trait_name);
+                        self.errors.push(CompileError::new(msg, *span));
                     }
                 }
                 
@@ -781,9 +835,14 @@ impl Compiler {
                                 local_count: 0,
                             };
                             let func_index = self.chunk.add_constant(Value::function(Rc::new(init_func)));
-                            self.chunk.register_static_field(name, field.name.clone(), func_index);
+                            // 使用不同的注册方法取决于是否是常量
+                            if field.is_const {
+                                self.chunk.register_static_const(name, field.name.clone(), func_index);
+                            } else {
+                                self.chunk.register_static_field(name, field.name.clone(), func_index);
+                            }
                         } else {
-                            // 没有初始值，使用 null
+                            // 没有初始值，使用 null（常量字段在解析器中已强制要求初始值）
                             let null_index = self.chunk.add_constant(Value::null());
                             self.chunk.register_static_field(name, field.name.clone(), null_index);
                         }
@@ -807,7 +866,7 @@ impl Compiler {
                 // 注册 interface
                 self.chunk.register_interface(name.clone(), method_infos);
             }
-            Stmt::TraitDef { name, methods, span: _ } => {
+            Stmt::TraitDef { name, type_params: _, methods, span: _ } => {
                 // 收集 trait 的方法信息
                 let mut method_infos = Vec::new();
                 
@@ -878,13 +937,34 @@ impl Compiler {
                 self.chunk.register_trait(name.clone(), method_infos);
             }
             Stmt::EnumDef { name, variants, span: _ } => {
-                // 收集 enum 变体信息
-                let variant_infos: Vec<_> = variants.iter().map(|v| {
-                    crate::compiler::bytecode::EnumVariantInfo {
+                // 收集 enum 变体信息，编译每个变体的值表达式
+                let mut variant_infos = Vec::new();
+                for v in variants {
+                    // 如果有关联值，编译表达式并存入常量池
+                    let value_index = if let Some(ref value_expr) = v.value {
+                        // 编译表达式获取常量值
+                        // 枚举值通常是常量表达式（整数字面量等）
+                        match self.expr_to_value(value_expr) {
+                            Ok(val) => Some(self.chunk.add_constant(val)),
+                            Err(err) => {
+                                // 非常量表达式，报错
+                                self.errors.push(CompileError::new(
+                                    format!("Enum variant value must be a constant expression: {}", err),
+                                    v.span,
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    variant_infos.push(crate::compiler::bytecode::EnumVariantInfo {
                         name: v.name.clone(),
                         fields: v.fields.iter().map(|(name, _)| name.clone()).collect(),
-                    }
-                }).collect();
+                        value_index,
+                    });
+                }
                 
                 // 注册 enum
                 self.chunk.register_enum(name.clone(), variant_infos);
@@ -894,30 +974,56 @@ impl Compiler {
                 self.type_aliases.insert(name.clone(), target_type.ty.clone());
             }
             Stmt::TryCatch { try_block, catch_param, catch_block, finally_block, span } => {
+                // 记录 try 块开始时的槽位，用于确保 catch 参数位置正确
+                let try_start_slot = self.symbols.current_slot();
+                
                 // 设置异常处理器
                 let setup_try = self.chunk.write_jump(OpCode::SetupTry, span.line);
                 
                 // 编译 try 块
                 self.compile_stmt(try_block);
                 
-                // try 块正常结束，跳过 catch 块
+                // try 块正常结束，需要清理可能产生的局部变量，跳过 catch 块
+                // 弹出 try 块中可能产生的临时值
+                let try_end_slot = self.symbols.current_slot();
+                for _ in try_start_slot..try_end_slot {
+                    self.chunk.write_op(OpCode::Pop, span.line);
+                }
                 let skip_catch = self.chunk.write_jump(OpCode::Jump, span.line);
                 
                 // catch 块起始位置
                 self.chunk.patch_jump(setup_try);
                 
-                // 如果有 catch 参数，定义它为局部变量
+                // 开始 catch 作用域
                 self.symbols.begin_scope();
+                
+                // 定义 catch 参数（如果有）
+                // 注意：VM 在抛出异常时会将栈恢复到 try 开始时的深度，然后推入异常值
+                // 所以异常值会在 try_start_slot 位置
                 if let Some(param_name) = catch_param {
-                    // 异常对象已经被 VM 推入栈
+                    // 设置符号表槽位与 VM 栈位置匹配
+                    self.symbols.set_current_slot(try_start_slot);
                     if let Err(msg) = self.symbols.define(param_name.clone(), crate::types::Type::Unknown, false) {
-                self.errors.push(CompileError::new(msg, *span));
-            }
+                        self.errors.push(CompileError::new(msg, *span));
+                    }
+                } else {
+                    // 没有 catch 参数，弹出异常值
+                    self.chunk.write_op(OpCode::Pop, span.line);
                 }
                 
                 // 编译 catch 块
                 self.compile_stmt(catch_block);
+                
+                // 结束 catch 作用域
                 self.symbols.end_scope();
+                
+                // 如果有 catch 参数，弹出异常值
+                if catch_param.is_some() {
+                    self.chunk.write_op(OpCode::Pop, span.line);
+                }
+                
+                // 恢复符号表槽位
+                self.symbols.set_current_slot(try_start_slot);
                 
                 // 跳过 catch 的跳转目标
                 self.chunk.patch_jump(skip_catch);
@@ -933,7 +1039,7 @@ impl Compiler {
                 // 生成 Throw 操作码
                 self.chunk.write_op(OpCode::Throw, span.line);
             }
-            Stmt::FnDef { name, params, return_type: _, body, span } => {
+            Stmt::FnDef { name, type_params: _, params, return_type: _, body, visibility: _, span } => {
                 // 编译命名函数定义（支持递归）
                 // 策略：先在常量池中预留位置并注册函数名，然后编译函数体
                 
@@ -1047,6 +1153,15 @@ impl Compiler {
                 self.errors.push(CompileError::new(msg, *span));
                 }
                 // 函数值已经在栈顶，define 会为它分配槽位
+            }
+            
+            // Package 和 Import 语句在编译阶段不生成字节码
+            // 它们是元数据，由包管理系统在编译前处理
+            Stmt::Package { .. } => {
+                // 包声明不生成字节码
+            }
+            Stmt::Import { .. } => {
+                // 导入声明不生成字节码（由包加载器处理）
             }
         }
     }
@@ -1181,10 +1296,33 @@ impl Compiler {
     }
     
     /// 编译 class 方法
-    fn compile_class_method(&mut self, class_name: &str, method: &crate::parser::ast::ClassMethod, _parent: Option<&str>, _span: Span) {
+    fn compile_class_method(&mut self, class_name: &str, method: &crate::parser::ast::ClassMethod, parent: Option<&str>, _span: Span) {
         use crate::parser::ast::ClassMethod;
         
-        let ClassMethod { name, params, return_type: _, body, visibility: _, is_static, is_override: _, is_abstract, span: method_span } = method;
+        let ClassMethod { name, params, return_type: _, body, visibility: _, is_static, is_override, is_abstract, span: method_span } = method;
+        
+        // override 检查：如果标记了 override，父类必须有同名方法
+        if *is_override {
+            if let Some(parent_name) = parent {
+                // 检查父类是否有该方法
+                let parent_has_method = self.chunk.get_method(parent_name, name).is_some();
+                if !parent_has_method {
+                    let msg = format!(
+                        "Method '{}' is marked as override but parent class '{}' has no such method",
+                        name, parent_name
+                    );
+                    self.errors.push(CompileError::new(msg, *method_span));
+                    return;
+                }
+            } else {
+                let msg = format!(
+                    "Method '{}' is marked as override but class '{}' has no parent class",
+                    name, class_name
+                );
+                self.errors.push(CompileError::new(msg, *method_span));
+                return;
+            }
+        }
         
         // 抽象方法没有方法体，只注册签名
         if *is_abstract {
@@ -1614,8 +1752,102 @@ impl Compiler {
                     }
                 }
                 
+                // 检查是否是静态成员调用 (ClassName::method(args))
+                if let Expr::StaticMember { class_name, member, span: member_span } = callee.as_ref() {
+                    // 检查是否是枚举的内置方法
+                    let is_enum_builtin = if self.chunk.get_enum(class_name).is_some() {
+                        member == "fromValue" || member == "values"
+                    } else {
+                        false
+                    };
+                    
+                    if is_enum_builtin {
+                        // 枚举内置方法，生成 InvokeStatic 调用
+                        let class_name_index = self.chunk.add_constant(Value::string(class_name.clone()));
+                        let method_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                        
+                        // 先编译所有参数
+                        for arg in args {
+                            self.compile_expr(arg);
+                        }
+                        
+                        // 生成 InvokeStatic 指令
+                        self.chunk.write_op(OpCode::InvokeStatic, span.line);
+                        self.chunk.write_u16(class_name_index, span.line);
+                        self.chunk.write_u16(method_name_index, span.line);
+                        self.chunk.write(args.len() as u8, span.line);
+                        return;
+                    }
+                    
+                    // 检查是否是静态方法
+                    let has_static_method = self.chunk.get_static_method(class_name, member).is_some();
+                    
+                    if has_static_method {
+                        let func_index = self.chunk.get_static_method(class_name, member).unwrap();
+                        
+                        // 检查参数数量
+                        if args.len() > u8::MAX as usize {
+                            let msg = "Too many arguments".to_string();
+                            self.errors.push(CompileError::new(msg, *span));
+                            return;
+                        }
+                        
+                        // 生成调用静态方法的指令
+                        // 1. 先从常量池加载函数
+                        self.chunk.write_op(OpCode::Const, span.line);
+                        self.chunk.write_u16(func_index, span.line);
+                        
+                        // 2. 然后编译所有参数
+                        for arg in args {
+                            self.compile_expr(arg);
+                        }
+                        
+                        // 3. 发出调用指令
+                        self.chunk.write_op(OpCode::Call, span.line);
+                        self.chunk.write(args.len() as u8, span.line);
+                        return;
+                    } else {
+                        let msg = format!("Type '{}' has no static method '{}'", class_name, member);
+                        self.errors.push(CompileError::new(msg, *member_span));
+                        return;
+                    }
+                }
+                
                 // 检查是否是方法调用 (obj.method(args))
                 if let Expr::Member { object, member, span: member_span } = callee.as_ref() {
+                    // 检查是否是 super 调用 (super.method(args))
+                    if matches!(object.as_ref(), Expr::Super { .. }) {
+                        // 编译 this（super 方法需要 this 作为 receiver）
+                        if let Some(slot) = self.symbols.resolve_slot("this") {
+                            self.chunk.write_get_local(slot, span.line);
+                        } else {
+                            let msg = "'super' can only be used inside a class method".to_string();
+                            self.errors.push(CompileError::new(msg, *span));
+                            return;
+                        }
+                        
+                        // 编译所有参数
+                        for arg in args {
+                            self.compile_expr(arg);
+                        }
+                        
+                        // 检查参数数量
+                        if args.len() > u8::MAX as usize {
+                            let msg = "Too many arguments".to_string();
+                            self.errors.push(CompileError::new(msg, *span));
+                            return;
+                        }
+                        
+                        // 将方法名添加到常量池
+                        let method_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                        
+                        // 生成 InvokeSuper 指令
+                        self.chunk.write_op(OpCode::InvokeSuper, span.line);
+                        self.chunk.write_u16(method_name_index, span.line);
+                        self.chunk.write(args.len() as u8, span.line);
+                        return;
+                    }
+                    
                     // 检查是否是静态方法调用 (ClassName.method(args))
                     if let Expr::Identifier { name: class_name, .. } = object.as_ref() {
                         // 检查是否是已注册的类名
@@ -2139,8 +2371,65 @@ impl Compiler {
                 }
             }
             Expr::Super { span } => {
-                let msg = "Super expression not yet implemented".to_string();
+                // super 不能单独使用，必须配合成员访问（super.method()）
+                let msg = "'super' must be used with member access (e.g., super.method())".to_string();
                 self.errors.push(CompileError::new(msg, *span));
+            }
+            Expr::Default { type_name, span } => {
+                // default 初始化：创建类型的默认实例
+                // 查找类型信息
+                if let Some(_type_info) = self.chunk.get_type(type_name) {
+                    // 创建新实例（调用无参构造函数或使用默认值）
+                    let type_name_idx = self.chunk.add_constant(Value::string(type_name.clone()));
+                    self.chunk.write_op(OpCode::NewClass, span.line);
+                    self.chunk.write_u16(type_name_idx, span.line);
+                    self.chunk.write(0, span.line);  // 0 个参数，使用默认值
+                } else {
+                    let msg = format!("Unknown type '{}' for default initialization", type_name);
+                    self.errors.push(CompileError::new(msg, *span));
+                }
+            }
+            Expr::StaticMember { class_name, member, span } => {
+                // 静态成员访问: ClassName::CONST 或 ClassName::field 或 EnumName::Variant
+                
+                // 先检查是否是枚举变体访问
+                if let Some(enum_info) = self.chunk.get_enum(class_name) {
+                    let has_variant = enum_info.variants.iter().any(|v| v.name == *member);
+                    if has_variant {
+                        // 枚举变体访问
+                        let enum_name_index = self.chunk.add_constant(Value::string(class_name.clone()));
+                        let variant_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                        self.chunk.write_op(OpCode::GetStatic, span.line);
+                        self.chunk.write_u16(enum_name_index, span.line);
+                        self.chunk.write_u16(variant_name_index, span.line);
+                        return;
+                    } else {
+                        let msg = format!("Enum '{}' has no variant '{}'", class_name, member);
+                        self.errors.push(CompileError::new(msg, *span));
+                        return;
+                    }
+                }
+                
+                // 检查类型信息是否存在，并获取是否有该静态字段
+                let has_static_member = if let Some(type_info) = self.chunk.get_type(class_name) {
+                    type_info.static_fields.contains_key(member)
+                } else {
+                    let msg = format!("Unknown class or enum '{}'", class_name);
+                    self.errors.push(CompileError::new(msg, *span));
+                    return;
+                };
+                
+                if has_static_member {
+                    // 静态字段访问
+                    let class_name_index = self.chunk.add_constant(Value::string(class_name.clone()));
+                    let field_name_index = self.chunk.add_constant(Value::string(member.clone()));
+                    self.chunk.write_op(OpCode::GetStatic, span.line);
+                    self.chunk.write_u16(class_name_index, span.line);
+                    self.chunk.write_u16(field_name_index, span.line);
+                } else {
+                    let msg = format!("Class '{}' has no static member '{}'", class_name, member);
+                    self.errors.push(CompileError::new(msg, *span));
+                }
             }
         }
     }

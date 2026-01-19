@@ -70,6 +70,16 @@ impl SymbolTable {
         self.scope_depth -= 1;
         count
     }
+    
+    /// 获取当前槽位
+    pub fn current_slot(&self) -> usize {
+        self.current_slot
+    }
+    
+    /// 设置当前槽位（用于 try/catch 等特殊场景）
+    pub fn set_current_slot(&mut self, slot: usize) {
+        self.current_slot = slot;
+    }
 
     /// Define a new symbol
     pub fn define(&mut self, name: String, ty: Type, is_const: bool) -> Result<usize, String> {
