@@ -5,8 +5,9 @@
 use crate::compiler::{Chunk, OpCode};
 use crate::i18n::{Locale, format_message, messages};
 use super::value::{Value, Iterator, IteratorSource, StructInstance, Function};
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use parking_lot::Mutex;
 
 /// 栈大小
 const STACK_SIZE: usize = 256;
@@ -22,7 +23,8 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
-    fn new(message: String, line: usize) -> Self {
+    /// 创建新的运行时错误
+    pub fn new(message: String, line: usize) -> Self {
         Self { message, line }
     }
 }
@@ -53,7 +55,7 @@ struct ExceptionHandler {
 /// 虚拟机
 pub struct VM {
     /// 字节码块
-    chunk: Chunk,
+    chunk: Arc<Chunk>,
     /// 指令指针
     ip: usize,
     /// 值栈
@@ -72,7 +74,7 @@ pub struct VM {
 
 impl VM {
     /// 创建新的虚拟机
-    pub fn new(chunk: Chunk, locale: Locale) -> Self {
+    pub fn new(chunk: Arc<Chunk>, locale: Locale) -> Self {
         Self {
             chunk,
             ip: 0,
@@ -83,6 +85,149 @@ impl VM {
             current_base: 0,
             static_fields: std::collections::HashMap::new(),
         }
+    }
+    
+    /// 创建同步版本的虚拟机（别名，保持兼容）
+    pub fn new_sync(chunk: Arc<Chunk>, locale: Locale) -> Self {
+        Self::new(chunk, locale)
+    }
+    
+    /// 运行协程（函数返回时自动退出）
+    pub fn run_coroutine(&mut self) -> Result<(), RuntimeError> {
+        self.run_coroutine_internal()
+    }
+    
+    /// 内部协程运行
+    fn run_coroutine_internal(&mut self) -> Result<(), RuntimeError> {
+        // 运行直到顶层帧返回
+        loop {
+            let op = self.read_byte();
+            
+            // 检查是否是返回指令
+            if op == 82 { // OpCode::Return
+                let return_value = self.pop_fast();
+                
+                if self.frames.is_empty() {
+                    // 没有调用帧了，协程结束
+                    return Ok(());
+                }
+                
+                let frame = self.frames.pop().unwrap();
+                
+                // 检查是否是协程的顶层帧（return_ip == u32::MAX）
+                if frame.return_ip == u32::MAX {
+                    // 协程结束
+                    return Ok(());
+                }
+                
+                let truncate_to = if frame.is_method_call {
+                    frame.base_slot as usize
+                } else {
+                    (frame.base_slot as usize).saturating_sub(1)
+                };
+                self.stack.truncate(truncate_to);
+                self.push_fast(return_value);
+                self.ip = frame.return_ip as usize;
+                self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                continue;
+            }
+            
+            // 检查是否是 Halt 指令
+            if op == 255 { // OpCode::Halt
+                return Ok(());
+            }
+            
+            // 回退并使用主循环处理
+            self.ip -= 1;
+            
+            // 执行主循环的一次迭代
+            if let Err(e) = self.execute_one_instruction_sync() {
+                return Err(e);
+            }
+        }
+    }
+    
+    /// 执行一条指令（用于协程，同步版本）
+    fn execute_one_instruction_sync(&mut self) -> Result<(), RuntimeError> {
+        // 保存当前 IP，用于检测是否处理了指令
+        let saved_ip = self.ip;
+        
+        // 调用 run()，但只执行一条指令就返回
+        // 这是一个简化的实现，实际上我们复用主循环
+        let op = self.read_byte();
+        let opcode = OpCode::from(op);
+        
+        // 执行简化版的指令
+        match opcode {
+            OpCode::Const => {
+                let index = self.read_u16() as usize;
+                let value = unsafe { self.chunk.constants.get_unchecked(index).clone() };
+                self.push_fast(value);
+            }
+            OpCode::Pop => {
+                self.pop()?;
+            }
+            OpCode::Add => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x + y));
+                } else {
+                    let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::GetLocal => {
+                let slot = self.read_u16() as usize;
+                let actual_slot = self.current_base + slot;
+                let value = self.stack[actual_slot].clone();
+                self.push_fast(value);
+            }
+            OpCode::SetLocal => {
+                let slot = self.read_u16() as usize;
+                let value = self.peek()?.clone();
+                let actual_slot = self.current_base + slot;
+                self.stack[actual_slot] = value;
+            }
+            OpCode::PrintLn => {
+                let value = self.pop_fast();
+                println!("{}", value);
+                self.push_fast(Value::null());
+            }
+            OpCode::Print => {
+                let value = self.pop_fast();
+                print!("{}", value);
+                self.push_fast(Value::null());
+            }
+            OpCode::Call => {
+                let arg_count = self.read_byte() as usize;
+                let callee_idx = self.stack.len() - arg_count - 1;
+                let callee = self.stack[callee_idx].clone();
+                
+                if let Some(func) = callee.as_function() {
+                    if self.frames.len() >= MAX_FRAMES {
+                        return Err(self.runtime_error("Stack overflow"));
+                    }
+                    let base_slot = callee_idx + 1;
+                    self.frames.push(CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: base_slot as u16,
+                        is_method_call: false,
+                    });
+                    self.current_base = base_slot;
+                    self.ip = func.chunk_index;
+                } else {
+                    return Err(self.runtime_error(&format!("Cannot call {}", callee.type_name())));
+                }
+            }
+            _ => {
+                // 其他指令：回退并报告不支持
+                // 实际上应该支持更多指令，这里简化处理
+                return Err(self.runtime_error(&format!("Unsupported instruction {:?} in coroutine", opcode)));
+            }
+        }
+        
+        Ok(())
     }
 
     /// 运行字节码
@@ -595,17 +740,17 @@ impl VM {
                     } else if value.is_function() {
                         0 // 函数大小不适用
                     } else if let Some(arr) = value.as_array() {
-                        arr.borrow().len() as i64
+                        arr.lock().len() as i64
                     } else if let Some(m) = value.as_map() {
-                        m.borrow().len() as i64
+                        m.lock().len() as i64
                     } else if value.is_range() {
                         24 // 两个i64 + bool
                     } else if value.is_iterator() {
                         0 // 迭代器大小不适用
                     } else if let Some(s) = value.as_struct() {
-                        s.borrow().fields.len() as i64 // 字段数量
+                        s.lock().fields.len() as i64 // 字段数量
                     } else if let Some(c) = value.as_class() {
-                        c.borrow().fields.len() as i64 // 字段数量
+                        c.lock().fields.len() as i64 // 字段数量
                     } else if let Some(e) = value.as_enum() {
                         e.associated_data.len() as i64 // 关联数据字段数量
                     } else {
@@ -645,13 +790,13 @@ impl VM {
                     } else if value.is_null() {
                         "null".to_string()
                     } else if let Some(arr) = value.as_array() {
-                        format!("{:?}", arr.borrow())
+                        format!("{:?}", arr.lock())
                     } else if let Some(m) = value.as_map() {
-                        format!("{:?}", m.borrow())
+                        format!("{:?}", m.lock())
                     } else if let Some(s) = value.as_struct() {
-                        format!("struct {}{{...}}", s.borrow().type_name)
+                        format!("struct {}{{...}}", s.lock().type_name)
                     } else if let Some(c) = value.as_class() {
-                        format!("class {}{{...}}", c.borrow().class_name)
+                        format!("class {}{{...}}", c.lock().class_name)
                     } else if let Some(e) = value.as_enum() {
                         format!("{}::{}", e.enum_name, e.variant_name)
                     } else {
@@ -715,7 +860,7 @@ impl VM {
                         elements.push(self.pop()?);
                     }
                     elements.reverse();
-                    self.push(Value::array(std::rc::Rc::new(std::cell::RefCell::new(elements))));
+                    self.push(Value::array(Arc::new(Mutex::new(elements))));
                 }
                 
                 OpCode::NewMap => {
@@ -740,7 +885,7 @@ impl VM {
                         };
                         map.insert(key_str, value);
                     }
-                    self.push(Value::map(std::rc::Rc::new(std::cell::RefCell::new(map))));
+                    self.push(Value::map(Arc::new(Mutex::new(map))));
                 }
                 
                 OpCode::GetIndex => {
@@ -748,7 +893,7 @@ impl VM {
                     let object = self.pop()?;
                     
                     if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
-                            let arr = arr.borrow();
+                            let arr = arr.lock();
                         let idx = if i < 0 {
                             (arr.len() as i64 + i) as usize
                             } else {
@@ -774,7 +919,7 @@ impl VM {
                                 )));
                             }
                     } else if let (Some(m), Some(key)) = (object.as_map(), index.as_string()) {
-                        let m = m.borrow();
+                        let m = m.lock();
                         if let Some(v) = m.get(key) {
                             self.push(v.clone());
                         } else {
@@ -793,7 +938,7 @@ impl VM {
                     let object = self.pop()?;
                     
                     if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
-                            let mut arr = arr.borrow_mut();
+                            let mut arr = arr.lock();
                         let idx = if i < 0 {
                             (arr.len() as i64 + i) as usize
                             } else {
@@ -807,7 +952,7 @@ impl VM {
                         arr[idx] = value;
                             self.push(value);
                     } else if let (Some(m), Some(key)) = (object.as_map(), index.as_string()) {
-                        let mut m = m.borrow_mut();
+                        let mut m = m.lock();
                         m.insert(key.clone(), value);
                         self.push(value);
                     } else {
@@ -864,7 +1009,7 @@ impl VM {
                                 iterable.type_name()
                             )));
                     };
-                    self.push(Value::iterator(std::rc::Rc::new(std::cell::RefCell::new(iter))));
+                    self.push(Value::iterator(Arc::new(Mutex::new(iter))));
                 }
                 
                 OpCode::IterNext => {
@@ -874,13 +1019,13 @@ impl VM {
                     if let Some(iter_rc) = iter_val.as_iterator() {
                         // 先获取当前索引和源的克隆
                         let (index, source_clone) = {
-                            let iter = iter_rc.borrow();
+                            let iter = iter_rc.lock();
                             (iter.index, iter.source.clone())
                         };
                         
                         let (value, has_more) = match source_clone {
                             IteratorSource::Array(arr) => {
-                                let arr = arr.borrow();
+                                let arr = arr.lock();
                                 if index < arr.len() {
                                     let value = arr[index].clone();
                                     (value, true)
@@ -906,7 +1051,7 @@ impl VM {
                         
                         // 如果有下一个元素，更新索引
                         if has_more {
-                            iter_rc.borrow_mut().index += 1;
+                            iter_rc.lock().index += 1;
                         }
                         
                         self.push(value);
@@ -1034,7 +1179,7 @@ impl VM {
                             }
                                 variadic_args.reverse();
                             
-                                self.push(Value::array(Rc::new(std::cell::RefCell::new(variadic_args))));
+                                self.push(Value::array(Arc::new(Mutex::new(variadic_args))));
                         }
                         
                             // 填充缺失的默认参数
@@ -1145,7 +1290,7 @@ impl VM {
                     
                     // 创建 struct 实例
                     let instance = StructInstance { type_name, fields };
-                    self.push(Value::struct_val(Rc::new(std::cell::RefCell::new(instance))));
+                    self.push(Value::struct_val(Arc::new(Mutex::new(instance))));
                 }
                 
                 OpCode::GetField => {
@@ -1158,7 +1303,7 @@ impl VM {
                     
                     let obj_val = self.pop()?;
                     if let Some(s) = obj_val.as_struct() {
-                        let s = s.borrow();
+                        let s = s.lock();
                         if let Some(value) = s.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
@@ -1168,7 +1313,7 @@ impl VM {
                             )));
                         }
                     } else if let Some(c) = obj_val.as_class() {
-                        let c = c.borrow();
+                        let c = c.lock();
                         if let Some(value) = c.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
@@ -1218,7 +1363,7 @@ impl VM {
                     let value = self.pop()?;
                     let obj_val = self.peek()?.clone(); // 保留对象在栈上
                     if let Some(s) = obj_val.as_struct() {
-                            let mut s = s.borrow_mut();
+                            let mut s = s.lock();
                             if s.fields.contains_key(&field_name) {
                                 s.fields.insert(field_name, value);
                             } else {
@@ -1228,7 +1373,7 @@ impl VM {
                                 )));
                             }
                     } else if let Some(c) = obj_val.as_class() {
-                        let mut c = c.borrow_mut();
+                        let mut c = c.lock();
                         // 对于 class，允许设置已定义的字段或新字段
                         c.fields.insert(field_name, value);
                     } else {
@@ -1262,14 +1407,14 @@ impl VM {
                     if obj_val.is_null() {
                         self.push(Value::null());
                     } else if let Some(s) = obj_val.as_struct() {
-                        let s = s.borrow();
+                        let s = s.lock();
                         if let Some(value) = s.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
                             self.push(Value::null());
                         }
                     } else if let Some(c) = obj_val.as_class() {
-                        let c = c.borrow();
+                        let c = c.lock();
                         if let Some(value) = c.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
@@ -1294,7 +1439,7 @@ impl VM {
                         return Err(self.runtime_error("Non-null assertion failed: value is null"));
                     }
                     if let Some(s) = obj_val.as_struct() {
-                        let s = s.borrow();
+                        let s = s.lock();
                         if let Some(value) = s.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
@@ -1304,7 +1449,7 @@ impl VM {
                             )));
                         }
                     } else if let Some(c) = obj_val.as_class() {
-                        let c = c.borrow();
+                        let c = c.lock();
                         if let Some(value) = c.fields.get(&field_name) {
                             self.push(value.clone());
                         } else {
@@ -1393,7 +1538,7 @@ impl VM {
                                     return Err(self.runtime_error("push() expects 1 argument"));
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
-                                arr.borrow_mut().push(value);
+                                arr.lock().push(value);
                                 // 移除参数和 receiver，返回 null
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::null());
@@ -1404,7 +1549,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("pop() expects 0 arguments"));
                                 }
-                                let popped = arr.borrow_mut().pop().unwrap_or(Value::null());
+                                let popped = arr.lock().pop().unwrap_or(Value::null());
                                 // 移除 receiver，返回弹出的值
                                 self.stack.truncate(receiver_idx);
                                 self.push(popped);
@@ -1415,7 +1560,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
-                                let len = arr.borrow().len() as i64;
+                                let len = arr.lock().len() as i64;
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
                                 continue;
@@ -1425,7 +1570,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("first() expects 0 arguments"));
                                 }
-                                let first = arr.borrow().first().cloned().unwrap_or(Value::null());
+                                let first = arr.lock().first().cloned().unwrap_or(Value::null());
                                 self.stack.truncate(receiver_idx);
                                 self.push(first);
                                 continue;
@@ -1435,7 +1580,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("last() expects 0 arguments"));
                                 }
-                                let last = arr.borrow().last().cloned().unwrap_or(Value::null());
+                                let last = arr.lock().last().cloned().unwrap_or(Value::null());
                                 self.stack.truncate(receiver_idx);
                                 self.push(last);
                                 continue;
@@ -1446,7 +1591,7 @@ impl VM {
                                     return Err(self.runtime_error("contains() expects 1 argument"));
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
-                                let contains = arr.borrow().contains(&value);
+                                let contains = arr.lock().contains(&value);
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::bool(contains));
                                 continue;
@@ -1456,7 +1601,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("reverse() expects 0 arguments"));
                                 }
-                                arr.borrow_mut().reverse();
+                                arr.lock().reverse();
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::null());
                                 continue;
@@ -1466,7 +1611,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("clear() expects 0 arguments"));
                                 }
-                                arr.borrow_mut().clear();
+                                arr.lock().clear();
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::null());
                                 continue;
@@ -1477,7 +1622,7 @@ impl VM {
                                     return Err(self.runtime_error("indexOf() expects 1 argument"));
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
-                                let idx = arr.borrow().iter().position(|x| x == &value)
+                                let idx = arr.lock().iter().position(|x| x == &value)
                                     .map(|i| i as i64)
                                     .unwrap_or(-1);
                                 self.stack.truncate(receiver_idx);
@@ -1490,7 +1635,7 @@ impl VM {
                                     return Err(self.runtime_error("lastIndexOf() expects 1 argument"));
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
-                                let idx = arr.borrow().iter().rposition(|x| x == &value)
+                                let idx = arr.lock().iter().rposition(|x| x == &value)
                                     .map(|i| i as i64)
                                     .unwrap_or(-1);
                                 self.stack.truncate(receiver_idx);
@@ -1507,7 +1652,7 @@ impl VM {
                                 } else {
                                     return Err(self.runtime_error("join() expects a string argument"));
                                 };
-                                let result: String = arr.borrow().iter()
+                                let result: String = arr.lock().iter()
                                     .map(|v| format!("{}", v))
                                     .collect::<Vec<_>>()
                                     .join(&sep);
@@ -1525,7 +1670,7 @@ impl VM {
                                 } else {
                                     return Err(self.runtime_error("slice() first argument must be integer"));
                                 };
-                                let arr_len = arr.borrow().len();
+                                let arr_len = arr.lock().len();
                                 let end = if arg_count == 2 {
                                     if let Some(i) = self.stack[receiver_idx + 2].as_int() {
                                         (i as usize).min(arr_len)
@@ -1535,9 +1680,9 @@ impl VM {
                                 } else {
                                     arr_len
                                 };
-                                let result: Vec<Value> = arr.borrow()[start.min(arr_len)..end].to_vec();
+                                let result: Vec<Value> = arr.lock()[start.min(arr_len)..end].to_vec();
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                self.push(Value::array(Arc::new(Mutex::new(result))));
                                 continue;
                             }
                             "concat" => {
@@ -1546,14 +1691,14 @@ impl VM {
                                     return Err(self.runtime_error("concat() expects 1 argument"));
                                 }
                                 let other = if let Some(a) = self.stack[receiver_idx + 1].as_array() {
-                                    a.borrow().clone()
+                                    a.lock().clone()
                                 } else {
                                     return Err(self.runtime_error("concat() expects an array argument"));
                                 };
-                                let mut result = arr.borrow().clone();
+                                let mut result = arr.lock().clone();
                                 result.extend(other);
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                self.push(Value::array(Arc::new(Mutex::new(result))));
                                 continue;
                             }
                             "copy" => {
@@ -1561,9 +1706,9 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("copy() expects 0 arguments"));
                                 }
-                                let result = arr.borrow().clone();
+                                let result = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(result))));
+                                self.push(Value::array(Arc::new(Mutex::new(result))));
                                 continue;
                             }
                             "isEmpty" => {
@@ -1571,7 +1716,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("isEmpty() expects 0 arguments"));
                                 }
-                                let result = arr.borrow().is_empty();
+                                let result = arr.lock().is_empty();
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::bool(result));
                                 continue;
@@ -1585,14 +1730,14 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("map() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut results = Vec::with_capacity(elements.len());
                                 for (i, elem) in elements.into_iter().enumerate() {
                                     let result = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
                                     results.push(result);
                                 }
-                                self.push(Value::array(Rc::new(RefCell::new(results))));
+                                self.push(Value::array(Arc::new(Mutex::new(results))));
                                 continue;
                             }
                             "filter" | "where" => {
@@ -1604,7 +1749,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("filter() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut results = Vec::new();
                                 for (i, elem) in elements.into_iter().enumerate() {
@@ -1613,7 +1758,7 @@ impl VM {
                                         results.push(elem);
                                     }
                                 }
-                                self.push(Value::array(Rc::new(RefCell::new(results))));
+                                self.push(Value::array(Arc::new(Mutex::new(results))));
                                 continue;
                             }
                             "reduce" | "fold" => {
@@ -1626,7 +1771,7 @@ impl VM {
                                     self.runtime_error("reduce() first argument must be a function")
                                 })?.clone();
                                 let mut acc = self.stack[receiver_idx + 2].clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 for (i, elem) in elements.into_iter().enumerate() {
                                     acc = self.call_closure(&func, &[acc, elem, Value::int(i as i64)])?;
@@ -1643,7 +1788,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("forEach() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 for (i, elem) in elements.into_iter().enumerate() {
                                     self.call_closure(&func, &[elem, Value::int(i as i64)])?;
@@ -1660,7 +1805,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("find() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut found = Value::null();
                                 for (i, elem) in elements.into_iter().enumerate() {
@@ -1682,7 +1827,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("findIndex() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut found_idx: i64 = -1;
                                 for (i, elem) in elements.into_iter().enumerate() {
@@ -1704,7 +1849,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("every() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut all_pass = true;
                                 for (i, elem) in elements.into_iter().enumerate() {
@@ -1726,7 +1871,7 @@ impl VM {
                                 let func = callback.as_function().ok_or_else(|| {
                                     self.runtime_error("some() expects a function argument")
                                 })?.clone();
-                                let elements = arr.borrow().clone();
+                                let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 let mut any_pass = false;
                                 for (i, elem) in elements.into_iter().enumerate() {
@@ -1744,7 +1889,7 @@ impl VM {
                                 if arg_count > 1 {
                                     return Err(self.runtime_error("sort() expects 0 or 1 argument"));
                                 }
-                                let mut elements = arr.borrow().clone();
+                                let mut elements = arr.lock().clone();
                                 if arg_count == 1 {
                                     let callback = self.stack[receiver_idx + 1].clone();
                                     let func = callback.as_function().ok_or_else(|| {
@@ -1778,7 +1923,7 @@ impl VM {
                                         }
                                     });
                                 }
-                                *arr.borrow_mut() = elements;
+                                *arr.lock() = elements;
                                 self.push(Value::null());
                                 continue;
                             }
@@ -1819,7 +1964,7 @@ impl VM {
                                     .map(|part| Value::string(part.to_string()))
                                     .collect();
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(parts))));
+                                self.push(Value::array(Arc::new(Mutex::new(parts))));
                                 continue;
                             }
                             "trim" => {
@@ -2084,7 +2229,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
-                                let len = map.borrow().len() as i64;
+                                let len = map.lock().len() as i64;
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
                                 continue;
@@ -2094,11 +2239,11 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("keys() expects 0 arguments"));
                                 }
-                                let keys: Vec<Value> = map.borrow().keys()
+                                let keys: Vec<Value> = map.lock().keys()
                                     .map(|k| Value::string(k.clone()))
                                     .collect();
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(keys))));
+                                self.push(Value::array(Arc::new(Mutex::new(keys))));
                                 continue;
                             }
                             "values" => {
@@ -2106,9 +2251,9 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("values() expects 0 arguments"));
                                 }
-                                let values: Vec<Value> = map.borrow().values().cloned().collect();
+                                let values: Vec<Value> = map.lock().values().cloned().collect();
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(values))));
+                                self.push(Value::array(Arc::new(Mutex::new(values))));
                                 continue;
                             }
                             "has" => {
@@ -2121,7 +2266,7 @@ impl VM {
                                 } else {
                                     return Err(self.runtime_error("Map key must be a string"));
                                 };
-                                let result = map.borrow().contains_key(&key);
+                                let result = map.lock().contains_key(&key);
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::bool(result));
                                 continue;
@@ -2141,7 +2286,7 @@ impl VM {
                                 } else {
                                     Value::null()
                                 };
-                                let result = map.borrow().get(&key).cloned().unwrap_or(default);
+                                let result = map.lock().get(&key).cloned().unwrap_or(default);
                                 self.stack.truncate(receiver_idx);
                                 self.push(result);
                                 continue;
@@ -2157,7 +2302,7 @@ impl VM {
                                     return Err(self.runtime_error("Map key must be a string"));
                                 };
                                 let value = self.stack[receiver_idx + 2];
-                                map.borrow_mut().insert(key, value);
+                                map.lock().insert(key, value);
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::null());
                                 continue;
@@ -2172,7 +2317,7 @@ impl VM {
                                 } else {
                                     return Err(self.runtime_error("Map key must be a string"));
                                 };
-                                let removed = map.borrow_mut().remove(&key).unwrap_or(Value::null());
+                                let removed = map.lock().remove(&key).unwrap_or(Value::null());
                                 self.stack.truncate(receiver_idx);
                                 self.push(removed);
                                 continue;
@@ -2182,7 +2327,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("clear() expects 0 arguments"));
                                 }
-                                map.borrow_mut().clear();
+                                map.lock().clear();
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::null());
                                 continue;
@@ -2192,7 +2337,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("isEmpty() expects 0 arguments"));
                                 }
-                                let result = map.borrow().is_empty();
+                                let result = map.lock().is_empty();
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::bool(result));
                                 continue;
@@ -2272,7 +2417,7 @@ impl VM {
                                     (start..end).map(Value::int).collect()
                                 };
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(arr))));
+                                self.push(Value::array(Arc::new(Mutex::new(arr))));
                                 continue;
                             }
                             "isInclusive" => {
@@ -2319,7 +2464,7 @@ impl VM {
                                     i += step_val;
                                 }
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::array(Rc::new(RefCell::new(arr))));
+                                self.push(Value::array(Arc::new(Mutex::new(arr))));
                                 continue;
                             }
                             _ => {
@@ -2333,9 +2478,9 @@ impl VM {
                     
                     // 获取类型名和方法
                     let type_name = if let Some(s) = receiver.as_struct() {
-                        s.borrow().type_name.clone()
+                        s.lock().type_name.clone()
                     } else if let Some(c) = receiver.as_class() {
-                        c.borrow().class_name.clone()
+                        c.lock().class_name.clone()
                     } else {
                         return Err(self.runtime_error(&format!(
                             "Cannot call method '{}' on {}",
@@ -2448,7 +2593,7 @@ impl VM {
                         parent_class: type_info.parent.clone(),
                         fields,
                     };
-                    let instance_value = Value::class(Rc::new(std::cell::RefCell::new(instance)));
+                    let instance_value = Value::class(Arc::new(Mutex::new(instance)));
                     
                     // 查找 init 构造函数
                     if let Some(init_index) = type_info.methods.get("init") {
@@ -2735,7 +2880,7 @@ impl VM {
                                 self.pop()?;
                             }
                             
-                            self.push(Value::array(Rc::new(std::cell::RefCell::new(values))));
+                            self.push(Value::array(Arc::new(Mutex::new(values))));
                             continue;
                         }
                     }
@@ -2808,7 +2953,7 @@ impl VM {
                     
                     // 获取父类名
                     let parent_class = if let Some(c) = receiver.as_class() {
-                        c.borrow().parent_class.clone()
+                        c.lock().parent_class.clone()
                     } else {
                         return Err(self.runtime_error("super can only be used in a class method"));
                     };
@@ -2874,7 +3019,7 @@ impl VM {
                     // 检查抛出的值是否是 Throwable 类型
                     let is_valid_throwable = if let Some(instance) = exception.as_class() {
                         // 检查类实例是否是 Throwable 或其子类
-                        let class_name = &instance.borrow().class_name;
+                        let class_name = &instance.lock().class_name;
                         self.is_throwable_class(class_name)
                     } else if let Some(s) = exception.as_string() {
                         // 检查字符串格式的异常（临时兼容）
@@ -2911,6 +3056,288 @@ impl VM {
                 
                 OpCode::Halt => {
                     return Ok(());
+                }
+                
+                // ============ 并发指令 ============
+                OpCode::GoSpawn => {
+                    use super::value::{ChannelState, WaitGroupState};
+                    use std::sync::atomic::Ordering;
+                    
+                    let arg_count = self.read_byte() as usize;
+                    
+                    // 从栈上获取参数
+                    let mut args = Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        args.push(self.pop()?);
+                    }
+                    args.reverse(); // 恢复参数顺序
+                    let callee = self.pop()?;
+                    
+                    // 获取函数对象
+                    if let Some(func) = callee.as_function() {
+                        let chunk = self.chunk.clone();
+                        let func = func.clone();
+                        
+                        // 简化实现：使用标准线程执行协程
+                        // 注意：这是一个临时的简化实现，后续会改为真正的协程调度
+                        std::thread::spawn(move || {
+                            // 创建协程 VM（同步执行）
+                            let mut coroutine_vm = VM::new_sync(chunk, Locale::En);
+                            
+                            // 压入函数值（占位）
+                            coroutine_vm.push_fast(Value::null());
+                            
+                            // 设置参数
+                            for arg in &args {
+                                coroutine_vm.push_fast(arg.clone());
+                            }
+                            
+                            // 创建调用帧，return_ip 设为一个特殊值表示协程退出
+                            coroutine_vm.frames.push(CallFrame {
+                                return_ip: u32::MAX, // 特殊标记：协程返回时退出
+                                base_slot: 1,
+                                is_method_call: false,
+                            });
+                            coroutine_vm.current_base = 1;
+                            
+                            // 跳转到函数体
+                            coroutine_vm.ip = func.chunk_index;
+                            
+                            // 同步执行协程
+                            if let Err(e) = coroutine_vm.run_coroutine() {
+                                eprintln!("Coroutine error at line {}: {}", e.line, e.message);
+                            }
+                        });
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot spawn {}", callee.type_name())));
+                    }
+                    
+                    // go 表达式返回 null
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::ChannelNew => {
+                    use super::value::ChannelState;
+                    
+                    // 创建 Channel（容量为 0 表示无缓冲）
+                    let capacity = self.read_u16() as usize;
+                    
+                    let (sender, receiver) = if capacity == 0 {
+                        // 无缓冲 channel（rendezvous）
+                        crossbeam_channel::bounded(0)
+                    } else {
+                        // 有缓冲 channel
+                        crossbeam_channel::bounded(capacity)
+                    };
+                    
+                    let state = Arc::new(Mutex::new(ChannelState {
+                        sender: Arc::new(Mutex::new(Some(sender))),
+                        receiver: Arc::new(Mutex::new(Some(receiver))),
+                        closed: Arc::new(AtomicBool::new(false)),
+                    }));
+                    
+                    self.push_fast(Value::channel(state));
+                }
+                
+                OpCode::ChannelSend => {
+                    let value = self.pop()?;
+                    let channel = self.pop()?;
+                    
+                    if let Some(ch_state) = channel.as_channel() {
+                        let state = ch_state.lock();
+                        let sender = state.sender.lock();
+                        
+                        if let Some(ref s) = *sender {
+                            if s.send(value).is_err() {
+                                return Err(self.runtime_error("Channel send failed: receiver closed"));
+                            }
+                        } else {
+                            return Err(self.runtime_error("Channel is closed"));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot send to {}", channel.type_name())));
+                    }
+                    
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::ChannelReceive => {
+                    let channel = self.pop()?;
+                    
+                    if let Some(ch_state) = channel.as_channel() {
+                        let state = ch_state.lock();
+                        let receiver = state.receiver.lock();
+                        
+                        if let Some(ref r) = *receiver {
+                            // 阻塞接收
+                            match r.recv() {
+                                Ok(value) => {
+                                    self.push_fast(value);
+                                }
+                                Err(_) => {
+                                    // Channel 已关闭且为空
+                                    self.push_fast(Value::null());
+                                }
+                            }
+                        } else {
+                            return Err(self.runtime_error("Channel receiver is closed"));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot receive from {}", channel.type_name())));
+                    }
+                }
+                
+                OpCode::ChannelTrySend => {
+                    let value = self.pop()?;
+                    let channel = self.pop()?;
+                    
+                    if let Some(ch_state) = channel.as_channel() {
+                        let state = ch_state.lock();
+                        let sender = state.sender.lock();
+                        
+                        if let Some(ref s) = *sender {
+                            let success = s.send(value).is_ok();
+                            self.push_fast(Value::bool(success));
+                        } else {
+                            self.push_fast(Value::bool(false));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot send to {}", channel.type_name())));
+                    }
+                }
+                
+                OpCode::ChannelTryReceive => {
+                    let channel = self.pop()?;
+                    
+                    if let Some(ch_state) = channel.as_channel() {
+                        let state = ch_state.lock();
+                        let receiver = state.receiver.lock();
+                        
+                        if let Some(ref r) = *receiver {
+                            match r.try_recv() {
+                                Ok(value) => {
+                                    self.push_fast(value);
+                                    self.push_fast(Value::bool(true));
+                                }
+                                Err(_) => {
+                                    self.push_fast(Value::null());
+                                    self.push_fast(Value::bool(false));
+                                }
+                            }
+                        } else {
+                            self.push_fast(Value::null());
+                            self.push_fast(Value::bool(false));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot receive from {}", channel.type_name())));
+                    }
+                }
+                
+                OpCode::ChannelClose => {
+                    use std::sync::atomic::Ordering;
+                    
+                    let channel = self.pop()?;
+                    
+                    if let Some(ch_state) = channel.as_channel() {
+                        let state = ch_state.lock();
+                        state.closed.store(true, Ordering::Relaxed);
+                        
+                        // 关闭 sender
+                        let mut sender = state.sender.lock();
+                        *sender = None;
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot close {}", channel.type_name())));
+                    }
+                    
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::MutexNew => {
+                    let initial_value = self.pop()?;
+                    let mutex = Arc::new(Mutex::new(initial_value));
+                    self.push_fast(Value::mutex(mutex));
+                }
+                
+                OpCode::MutexLock => {
+                    let mutex_val = self.pop()?;
+                    
+                    if let Some(m) = mutex_val.as_mutex() {
+                        // 返回被锁定的值（简化版本，实际应该返回 guard）
+                        let value = m.lock().clone();
+                        self.push_fast(value);
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot lock {}", mutex_val.type_name())));
+                    }
+                }
+                
+                OpCode::WaitGroupNew => {
+                    use super::value::WaitGroupState;
+                    
+                    let state = Arc::new(WaitGroupState {
+                        counter: Arc::new(AtomicUsize::new(0)),
+                        mutex: Arc::new(Mutex::new(())),
+                        condvar: Arc::new(parking_lot::Condvar::new()),
+                    });
+                    self.push_fast(Value::waitgroup(state));
+                }
+                
+                OpCode::WaitGroupAdd => {
+                    use std::sync::atomic::Ordering;
+                    
+                    let delta = self.pop()?;
+                    let wg = self.pop()?;
+                    
+                    if let Some(state) = wg.as_waitgroup() {
+                        if let Some(n) = delta.as_int() {
+                            if n > 0 {
+                                state.counter.fetch_add(n as usize, Ordering::SeqCst);
+                            } else if n < 0 {
+                                state.counter.fetch_sub((-n) as usize, Ordering::SeqCst);
+                            }
+                        } else {
+                            return Err(self.runtime_error("WaitGroup add requires int"));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot add to {}", wg.type_name())));
+                    }
+                    
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::WaitGroupDone => {
+                    use std::sync::atomic::Ordering;
+                    
+                    let wg = self.pop()?;
+                    
+                    if let Some(state) = wg.as_waitgroup() {
+                        let old = state.counter.fetch_sub(1, Ordering::SeqCst);
+                        if old == 1 {
+                            // 计数器归零，通知所有等待者
+                            state.condvar.notify_all();
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot done on {}", wg.type_name())));
+                    }
+                    
+                    self.push_fast(Value::null());
+                }
+                
+                OpCode::WaitGroupWait => {
+                    use std::sync::atomic::Ordering;
+                    
+                    let wg = self.pop()?;
+                    
+                    if let Some(state) = wg.as_waitgroup() {
+                        // 阻塞等待计数器归零
+                        let mut guard = state.mutex.lock();
+                        while state.counter.load(Ordering::SeqCst) != 0 {
+                            state.condvar.wait(&mut guard);
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!("Cannot wait on {}", wg.type_name())));
+                    }
+                    
+                    self.push_fast(Value::null());
                 }
                 
                 // ============ 专用整数指令 (性能优化) ============
@@ -3210,7 +3637,7 @@ impl VM {
     
     /// 调用闭包函数并返回结果
     /// 用于高阶数组方法（map、filter、reduce 等）
-    fn call_closure(&mut self, func: &Rc<Function>, args: &[Value]) -> Result<Value, RuntimeError> {
+    fn call_closure(&mut self, func: &Arc<Function>, args: &[Value]) -> Result<Value, RuntimeError> {
         // 检查参数数量
         let provided = args.len();
         let expected = func.arity;
@@ -3687,12 +4114,12 @@ impl VM {
             _ => {
                 // 对于自定义类型，检查类型名称是否匹配
                 if let Some(s) = value.as_struct() {
-                    if s.borrow().type_name == target_type {
+                    if s.lock().type_name == target_type {
                         return value;
                     }
                 }
                 if let Some(c) = value.as_class() {
-                    if c.borrow().class_name == target_type {
+                    if c.lock().class_name == target_type {
                         return value;
                     }
                 }
@@ -3720,9 +4147,9 @@ impl VM {
             _ => {
                 // 检查自定义类型
                 if let Some(s) = value.as_struct() {
-                    s.borrow().type_name == type_name
+                    s.lock().type_name == type_name
                 } else if let Some(c) = value.as_class() {
-                    c.borrow().class_name == type_name
+                    c.lock().class_name == type_name
                 } else if let Some(e) = value.as_enum() {
                     e.enum_name == type_name
                 } else {
@@ -3737,7 +4164,7 @@ impl VM {
     fn try_operator_overload(&mut self, a: &Value, b: &Value, op_name: &str) -> Result<Option<Value>, RuntimeError> {
         // 只检查 Class 类型的运算符重载
         if let Some(instance) = a.as_class() {
-            let class_name = instance.borrow().class_name.clone();
+            let class_name = instance.lock().class_name.clone();
             let method_name = format!("operator_{}", op_name);
             
             // 检查是否有对应的运算符重载方法
@@ -3848,7 +4275,7 @@ impl VM {
                 };
                 let instance = self.pop()?;
                 if let Some(c) = instance.as_class() {
-                    let c = c.borrow();
+                    let c = c.lock();
                     if let Some(value) = c.fields.get(&field_name) {
                         self.push(value.clone());
                     } else {
@@ -3865,6 +4292,357 @@ impl VM {
                 return Err(self.runtime_error("Unsupported instruction in operator overload"));
             }
         }
+        Ok(())
+    }
+    
+    // ============== 协程支持方法 ==============
+    
+    /// 获取当前指令指针
+    #[inline]
+    pub fn ip(&self) -> usize {
+        self.ip
+    }
+    
+    /// 设置指令指针
+    #[inline]
+    pub fn set_ip_value(&mut self, ip: usize) {
+        self.ip = ip;
+    }
+    
+    /// 获取当前栈基址
+    #[inline]
+    pub fn current_base(&self) -> usize {
+        self.current_base
+    }
+    
+    /// 设置栈基址
+    #[inline]
+    pub fn set_current_base(&mut self, base: usize) {
+        self.current_base = base;
+    }
+    
+    /// 保存值栈快照
+    pub fn save_stack(&self) -> Vec<Value> {
+        self.stack.clone()
+    }
+    
+    /// 恢复值栈
+    pub fn restore_stack(&mut self, stack: &[Value]) {
+        self.stack.clear();
+        self.stack.extend(stack.iter().cloned());
+    }
+    
+    /// 保存调用帧快照
+    pub fn save_frames(&self) -> Vec<crate::runtime::context::CallFrameSnapshot> {
+        self.frames.iter().map(|f| crate::runtime::context::CallFrameSnapshot {
+            return_ip: f.return_ip,
+            base_slot: f.base_slot,
+            is_method_call: f.is_method_call,
+        }).collect()
+    }
+    
+    /// 恢复调用帧
+    pub fn restore_frames(&mut self, frames: &[crate::runtime::context::CallFrameSnapshot]) {
+        self.frames.clear();
+        for f in frames {
+            self.frames.push(CallFrame {
+                return_ip: f.return_ip,
+                base_slot: f.base_slot,
+                is_method_call: f.is_method_call,
+            });
+        }
+        // 更新 current_base
+        self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+    }
+    
+    /// 压入值（公共接口）
+    pub fn push_value(&mut self, value: Value) {
+        self.stack.push(value);
+    }
+    
+    /// 执行单条指令
+    /// 
+    /// 返回 Ok(true) 表示继续执行，Ok(false) 表示执行完毕
+    pub fn step(&mut self) -> Result<bool, RuntimeError> {
+        if self.ip >= self.chunk.code.len() {
+            return Ok(false);
+        }
+        
+        let op = self.read_byte();
+        let opcode = OpCode::from(op);
+        
+        // 检查是否结束
+        match opcode {
+            OpCode::Halt => return Ok(false),
+            OpCode::Return => {
+                let return_value = self.pop_fast();
+                
+                if self.frames.is_empty() {
+                    return Ok(false);
+                }
+                
+                let frame = self.frames.pop().unwrap();
+                
+                if frame.return_ip == u32::MAX {
+                    return Ok(false);
+                }
+                
+                let truncate_to = if frame.is_method_call {
+                    frame.base_slot as usize
+                } else {
+                    (frame.base_slot as usize).saturating_sub(1)
+                };
+                self.stack.truncate(truncate_to);
+                self.push_fast(return_value);
+                self.ip = frame.return_ip as usize;
+                self.current_base = self.frames.last().map(|f| f.base_slot as usize).unwrap_or(0);
+                return Ok(true);
+            }
+            _ => {
+                // 回退让主循环处理
+                self.ip -= 1;
+                
+                // 使用简化的同步执行
+                // 注意：这里我们无法调用 async 方法，所以对于需要异步的指令会报错
+                self.step_sync()?;
+                return Ok(true);
+            }
+        }
+    }
+    
+    /// 同步执行单条指令（简化版本）
+    fn step_sync(&mut self) -> Result<(), RuntimeError> {
+        let op = self.read_byte();
+        let opcode = OpCode::from(op);
+        
+        match opcode {
+            OpCode::Const => {
+                let index = self.read_u16() as usize;
+                let value = unsafe { self.chunk.constants.get_unchecked(index).clone() };
+                self.push_fast(value);
+            }
+            OpCode::Pop => {
+                self.pop()?;
+            }
+            OpCode::Add => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x + y));
+                } else {
+                    let result = (a + b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Sub => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x - y));
+                } else {
+                    let result = (a - b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Mul => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::int(x * y));
+                } else {
+                    let result = (a * b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Div => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    if y == 0 {
+                        return Err(self.runtime_error("Division by zero"));
+                    }
+                    self.push_fast(Value::int(x / y));
+                } else {
+                    let result = (a / b).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::Neg => {
+                let v = self.pop_fast();
+                if let Some(x) = v.as_int() {
+                    self.push_fast(Value::int(-x));
+                } else {
+                    let result = (-v).map_err(|e| self.runtime_error(&e))?;
+                    self.push_fast(result);
+                }
+            }
+            OpCode::GetLocal => {
+                let slot = self.read_u16() as usize;
+                let actual_slot = self.current_base + slot;
+                let value = self.stack[actual_slot].clone();
+                self.push_fast(value);
+            }
+            OpCode::SetLocal => {
+                let slot = self.read_u16() as usize;
+                let value = self.peek()?.clone();
+                let actual_slot = self.current_base + slot;
+                self.stack[actual_slot] = value;
+            }
+            OpCode::Jump => {
+                let offset = self.read_u16() as usize;
+                self.ip = offset;
+            }
+            OpCode::JumpIfFalse => {
+                let offset = self.read_u16() as usize;
+                let cond = self.peek()?;
+                if !cond.is_truthy() {
+                    self.ip = offset;
+                }
+            }
+            OpCode::JumpIfFalsePop => {
+                let offset = self.read_u16() as usize;
+                let cond = self.pop_fast();
+                if !cond.is_truthy() {
+                    self.ip = offset;
+                }
+            }
+            OpCode::Lt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x < y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::bool(x < y));
+                } else {
+                    return Err(self.runtime_error("Cannot compare values"));
+                }
+            }
+            OpCode::Le => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x <= y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::bool(x <= y));
+                } else {
+                    return Err(self.runtime_error("Cannot compare values"));
+                }
+            }
+            OpCode::Gt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x > y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::bool(x > y));
+                } else {
+                    return Err(self.runtime_error("Cannot compare values"));
+                }
+            }
+            OpCode::Ge => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+                    self.push_fast(Value::bool(x >= y));
+                } else if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+                    self.push_fast(Value::bool(x >= y));
+                } else {
+                    return Err(self.runtime_error("Cannot compare values"));
+                }
+            }
+            OpCode::Eq => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                self.push_fast(Value::bool(a == b));
+            }
+            OpCode::Ne => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                self.push_fast(Value::bool(a != b));
+            }
+            OpCode::PrintLn => {
+                let value = self.pop_fast();
+                println!("{}", value);
+                self.push_fast(Value::null());
+            }
+            OpCode::Print => {
+                let value = self.pop_fast();
+                print!("{}", value);
+                self.push_fast(Value::null());
+            }
+            OpCode::Call => {
+                let arg_count = self.read_byte() as usize;
+                let callee_idx = self.stack.len() - arg_count - 1;
+                let callee = self.stack[callee_idx].clone();
+                
+                if let Some(func) = callee.as_function() {
+                    if self.frames.len() >= MAX_FRAMES {
+                        return Err(self.runtime_error("Stack overflow"));
+                    }
+                    let base_slot = callee_idx + 1;
+                    self.frames.push(CallFrame {
+                        return_ip: self.ip as u32,
+                        base_slot: base_slot as u16,
+                        is_method_call: false,
+                    });
+                    self.current_base = base_slot;
+                    self.ip = func.chunk_index;
+                } else {
+                    return Err(self.runtime_error(&format!("Cannot call {}", callee.type_name())));
+                }
+            }
+            OpCode::ConstInt8 => {
+                let value = self.read_byte() as i8 as i64;
+                self.push_fast(Value::int(value));
+            }
+            OpCode::AddInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = a.as_int().unwrap_or(0);
+                let y = b.as_int().unwrap_or(0);
+                self.push_fast(Value::int(x + y));
+            }
+            OpCode::SubInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = a.as_int().unwrap_or(0);
+                let y = b.as_int().unwrap_or(0);
+                self.push_fast(Value::int(x - y));
+            }
+            OpCode::MulInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = a.as_int().unwrap_or(0);
+                let y = b.as_int().unwrap_or(0);
+                self.push_fast(Value::int(x * y));
+            }
+            OpCode::LtInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = a.as_int().unwrap_or(0);
+                let y = b.as_int().unwrap_or(0);
+                self.push_fast(Value::bool(x < y));
+            }
+            OpCode::LeInt => {
+                let b = self.pop_fast();
+                let a = self.pop_fast();
+                let x = a.as_int().unwrap_or(0);
+                let y = b.as_int().unwrap_or(0);
+                self.push_fast(Value::bool(x <= y));
+            }
+            OpCode::GetLocalInt => {
+                let slot = self.read_u16() as usize;
+                let actual_slot = self.current_base + slot;
+                let value = self.stack[actual_slot].clone();
+                self.push_fast(value);
+            }
+            _ => {
+                return Err(self.runtime_error(&format!(
+                    "Unsupported instruction {:?} in coroutine step", opcode
+                )));
+            }
+        }
+        
         Ok(())
     }
 }
@@ -3884,7 +4662,8 @@ mod tests {
         let program = parser.parse().unwrap();
         let mut compiler = Compiler::new(Locale::En);
         let chunk = compiler.compile(&program).unwrap();
-        let mut vm = VM::new(chunk, Locale::En);
+        let chunk_arc = Arc::new(chunk);
+        let mut vm = VM::new(chunk_arc, Locale::En);
         vm.run()
     }
 

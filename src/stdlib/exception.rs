@@ -179,7 +179,7 @@ impl ExceptionLib {
         
         // 检查是否是类实例
         if let Some(instance) = args[0].as_class() {
-            let class_name = &instance.borrow().class_name;
+            let class_name = &instance.lock().class_name;
             return Ok(Value::bool(is_throwable_type(class_name)));
         }
         
@@ -214,7 +214,7 @@ impl ExceptionLib {
         
         // 检查是否是类实例
         if let Some(instance) = args[0].as_class() {
-            let class_name = &instance.borrow().class_name;
+            let class_name = &instance.lock().class_name;
             return Ok(Value::bool(exception_types.contains(&class_name.as_str())));
         }
         

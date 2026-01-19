@@ -1946,6 +1946,18 @@ impl Parser {
                 Ok(Expr::Super { span: token.span })
             }
             
+            // go 关键字：启动协程
+            TokenKind::Go => {
+                let start_span = token.span;
+                // 解析后面的函数调用表达式
+                let call = self.parse_expression()?;
+                let end_span = call.span();
+                Ok(Expr::Go {
+                    call: Box::new(call),
+                    span: Span::new(start_span.start, end_span.end, start_span.line, start_span.column),
+                })
+            }
+            
             // 数组字面量 [1, 2, 3]
             TokenKind::LeftBracket => {
                 let start_span = token.span;

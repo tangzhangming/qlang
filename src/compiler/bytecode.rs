@@ -248,6 +248,61 @@ pub enum OpCode {
     /// 条件返回（如果栈顶为真，返回第二个栈值）
     ReturnIf = 138,
     
+    // ============ 并发指令 (140-160) ============
+    /// 启动协程
+    /// 操作数: 参数数量 (u8)
+    /// 栈: [..., closure, arg1, ..., argN] -> [...]
+    GoSpawn = 140,
+    
+    /// 创建 Channel
+    /// 操作数: 容量 (u16)
+    /// 栈: [...] -> [..., channel]
+    ChannelNew = 141,
+    
+    /// Channel 发送（阻塞）
+    /// 栈: [..., channel, value] -> [...]
+    ChannelSend = 142,
+    
+    /// Channel 接收（阻塞）
+    /// 栈: [..., channel] -> [..., value]
+    ChannelReceive = 143,
+    
+    /// Channel 尝试发送（非阻塞）
+    /// 栈: [..., channel, value] -> [..., success:bool]
+    ChannelTrySend = 144,
+    
+    /// Channel 尝试接收（非阻塞）
+    /// 栈: [..., channel] -> [..., value?, has_value:bool]
+    ChannelTryReceive = 145,
+    
+    /// Channel 关闭
+    /// 栈: [..., channel] -> [...]
+    ChannelClose = 146,
+    
+    /// 创建 Mutex
+    /// 栈: [..., initial_value] -> [..., mutex]
+    MutexNew = 150,
+    
+    /// Mutex 加锁（返回 guard）
+    /// 栈: [..., mutex] -> [..., guard]
+    MutexLock = 151,
+    
+    /// 创建 WaitGroup
+    /// 栈: [...] -> [..., wait_group]
+    WaitGroupNew = 155,
+    
+    /// WaitGroup add
+    /// 栈: [..., wait_group, delta] -> [...]
+    WaitGroupAdd = 156,
+    
+    /// WaitGroup done
+    /// 栈: [..., wait_group] -> [...]
+    WaitGroupDone = 157,
+    
+    /// WaitGroup wait
+    /// 栈: [..., wait_group] -> [...]
+    WaitGroupWait = 158,
+    
     // ============ 控制 ============
     /// 停止执行
     Halt = 255,
@@ -342,6 +397,20 @@ impl From<u8> for OpCode {
             136 => OpCode::DecInt,
             137 => OpCode::GetLocalLeInt,
             138 => OpCode::ReturnIf,
+            // 并发指令
+            140 => OpCode::GoSpawn,
+            141 => OpCode::ChannelNew,
+            142 => OpCode::ChannelSend,
+            143 => OpCode::ChannelReceive,
+            144 => OpCode::ChannelTrySend,
+            145 => OpCode::ChannelTryReceive,
+            146 => OpCode::ChannelClose,
+            150 => OpCode::MutexNew,
+            151 => OpCode::MutexLock,
+            155 => OpCode::WaitGroupNew,
+            156 => OpCode::WaitGroupAdd,
+            157 => OpCode::WaitGroupDone,
+            158 => OpCode::WaitGroupWait,
             255 => OpCode::Halt,
             _ => panic!("Unknown opcode: {}", value),
         }

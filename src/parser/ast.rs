@@ -214,6 +214,11 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    /// go 表达式：启动协程
+    Go {
+        call: Box<Expr>,  // 必须是一个 Call 表达式
+        span: Span,
+    },
     /// 赋值表达式
     Assign {
         target: Box<Expr>,
@@ -364,6 +369,7 @@ impl Expr {
             Expr::Unary { span, .. } => *span,
             Expr::Grouping { span, .. } => *span,
             Expr::Call { span, .. } => *span,
+            Expr::Go { span, .. } => *span,
             Expr::Assign { span, .. } => *span,
             Expr::Index { span, .. } => *span,
             Expr::Member { span, .. } => *span,

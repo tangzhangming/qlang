@@ -11,6 +11,7 @@ mod vm;
 mod types;
 mod package;
 mod stdlib;
+mod runtime;
 
 use std::env;
 use std::fs;
@@ -62,7 +63,8 @@ fn run(source: &str, locale: Locale) -> Result<(), String> {
     })?;
     
     // 执行
-    let mut vm = VM::new(chunk, locale);
+    let chunk_arc = std::sync::Arc::new(chunk);
+    let mut vm = VM::new(chunk_arc, locale);
     vm.run().map_err(|e| format!("[line {}] {}", e.line, e.message))?;
     
     Ok(())

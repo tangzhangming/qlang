@@ -2,7 +2,8 @@
 //! 
 //! 将 AST 编译为字节码
 
-use std::rc::Rc;
+use std::sync::Arc;
+use parking_lot::Mutex;
 use crate::parser::{Expr, Stmt, Program, BinOp, UnaryOp};
 use crate::vm::{Value, value::Function};
 use crate::i18n::Locale;
@@ -834,7 +835,7 @@ impl Compiler {
                                 chunk_index: value_start,
                                 local_count: 0,
                             };
-                            let func_index = self.chunk.add_constant(Value::function(Rc::new(init_func)));
+                            let func_index = self.chunk.add_constant(Value::function(Arc::new(init_func)));
                             // 使用不同的注册方法取决于是否是常量
                             if field.is_const {
                                 self.chunk.register_static_const(name, field.name.clone(), func_index);
@@ -934,7 +935,7 @@ impl Compiler {
                             local_count,
                         };
                         
-                        Some(self.chunk.add_constant(Value::function(Rc::new(func))))
+                        Some(self.chunk.add_constant(Value::function(Arc::new(func))))
                     } else {
                         None
                     };
@@ -1157,7 +1158,7 @@ impl Compiler {
                     chunk_index: func_start,
                     local_count,
                 };
-                self.chunk.constants[func_index as usize] = Value::function(Rc::new(func));
+                self.chunk.constants[func_index as usize] = Value::function(Arc::new(func));
                 
                 // 13. 在当前作用域定义函数变量
                 self.chunk.write_op(OpCode::Const, span.line);
@@ -1304,7 +1305,7 @@ impl Compiler {
         };
         
         // 12. 添加到常量池并注册方法
-        let func_index = self.chunk.add_constant(Value::function(Rc::new(func)));
+        let func_index = self.chunk.add_constant(Value::function(Arc::new(func)));
         self.chunk.register_method(struct_name, name.clone(), func_index);
     }
     
@@ -1486,7 +1487,7 @@ impl Compiler {
         };
         
         // 12. 添加到常量池并注册方法（静态或实例）
-        let func_index = self.chunk.add_constant(Value::function(Rc::new(func)));
+        let func_index = self.chunk.add_constant(Value::function(Arc::new(func)));
         if *is_static {
             self.chunk.register_static_method(class_name, name.clone(), func_index);
         } else {
@@ -2266,7 +2267,7 @@ impl Compiler {
                     chunk_index: func_start,
                     local_count,
                 };
-                self.chunk.write_constant(Value::function(Rc::new(func)), span.line);
+                self.chunk.write_constant(Value::function(Arc::new(func)), span.line);
             }
             Expr::StructLiteral { name, fields, span } => {
                 // 编译 struct 字面量
@@ -2461,6 +2462,30 @@ impl Compiler {
                     self.chunk.write_u16(field_name_index, span.line);
                 } else {
                     let msg = format!("Class '{}' has no static member '{}'", class_name, member);
+                    self.errors.push(CompileError::new(msg, *span));
+                }
+            }
+            
+            // go 表达式：启动协程
+            Expr::Go { call, span } => {
+                // 编译被调用的表达式（必须是一个 Call 表达式）
+                if let Expr::Call { callee, args, .. } = call.as_ref() {
+                    // 编译闭包/函数
+                    self.compile_expr(callee);
+                    
+                    // 编译参数
+                    for arg in args {
+                        self.compile_expr(arg);
+                    }
+                    
+                    // 生成 GoSpawn 指令
+                    self.chunk.write_op(OpCode::GoSpawn, span.line);
+                    self.chunk.write(args.len() as u8, span.line);
+                    
+                    // go 表达式返回 null（或者未来可以返回 JoinHandle）
+                    self.chunk.write_constant(Value::null(), span.line);
+                } else {
+                    let msg = "go expression must be followed by a function call".to_string();
                     self.errors.push(CompileError::new(msg, *span));
                 }
             }

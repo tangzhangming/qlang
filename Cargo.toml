@@ -6,6 +6,18 @@ description = "A programming language compiler and virtual machine"
 authors = ["Usopp"]
 
 [dependencies]
+parking_lot = "0.12"
+crossbeam = "0.8"
+crossbeam-deque = "0.8"
+crossbeam-utils = "0.8"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "synchapi", "handleapi", "minwindef"] }
 
 [profile.release]
 opt-level = 3

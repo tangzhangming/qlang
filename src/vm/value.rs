@@ -15,8 +15,9 @@
 #![allow(dead_code)]
 
 use std::fmt;
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 
 // ============================================================================
@@ -79,6 +80,9 @@ pub enum HeapTag {
     Enum = 8,
     TypeRef = 9,
     Int64 = 10,
+    Channel = 11,
+    MutexValue = 12,
+    WaitGroup = 13,
 }
 
 /// 堆对象头部
@@ -139,27 +143,27 @@ impl PartialEq for Function {
 #[repr(C)]
 pub struct HeapFunction {
     pub header: HeapObject,
-    pub data: Rc<Function>,
+    pub data: Arc<Function>,
 }
 
 /// 堆上的数组
 #[repr(C)]
 pub struct HeapArray {
     pub header: HeapObject,
-    pub data: Rc<RefCell<Vec<Value>>>,
+    pub data: Arc<Mutex<Vec<Value>>>,
 }
 
 /// 堆上的 Map
 #[repr(C)]
 pub struct HeapMap {
     pub header: HeapObject,
-    pub data: Rc<RefCell<HashMap<String, Value>>>,
+    pub data: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 /// 迭代器数据源
 #[derive(Debug, Clone)]
 pub enum IteratorSource {
-    Array(Rc<RefCell<Vec<Value>>>),
+    Array(Arc<Mutex<Vec<Value>>>),
     Range(i64, i64, bool),
 }
 
@@ -180,7 +184,7 @@ impl PartialEq for Iterator {
 #[repr(C)]
 pub struct HeapIterator {
     pub header: HeapObject,
-    pub data: Rc<RefCell<Iterator>>,
+    pub data: Arc<Mutex<Iterator>>,
 }
 
 /// Struct 实例
@@ -200,7 +204,7 @@ impl PartialEq for StructInstance {
 #[repr(C)]
 pub struct HeapStruct {
     pub header: HeapObject,
-    pub data: Rc<RefCell<StructInstance>>,
+    pub data: Arc<Mutex<StructInstance>>,
 }
 
 /// Class 实例
@@ -221,7 +225,7 @@ impl PartialEq for ClassInstance {
 #[repr(C)]
 pub struct HeapClass {
     pub header: HeapObject,
-    pub data: Rc<RefCell<ClassInstance>>,
+    pub data: Arc<Mutex<ClassInstance>>,
 }
 
 /// Enum 变体值
@@ -245,6 +249,45 @@ pub struct HeapEnum {
 pub struct HeapTypeRef {
     pub header: HeapObject,
     pub data: String,
+}
+
+// ============================================================================
+// 并发对象定义
+// ============================================================================
+
+/// Channel 内部状态
+pub struct ChannelState {
+    pub sender: Arc<Mutex<Option<crossbeam_channel::Sender<Value>>>>,
+    pub receiver: Arc<Mutex<Option<crossbeam_channel::Receiver<Value>>>>,
+    pub closed: Arc<AtomicBool>,
+}
+
+/// 堆上的 Channel
+#[repr(C)]
+pub struct HeapChannel {
+    pub header: HeapObject,
+    pub state: Arc<Mutex<ChannelState>>,
+}
+
+/// 堆上的 Mutex（封装一个 Value）
+#[repr(C)]
+pub struct HeapMutex {
+    pub header: HeapObject,
+    pub inner: Arc<Mutex<Value>>,
+}
+
+/// WaitGroup 内部状态
+pub struct WaitGroupState {
+    pub counter: Arc<AtomicUsize>,
+    pub mutex: Arc<Mutex<()>>,
+    pub condvar: Arc<parking_lot::Condvar>,
+}
+
+/// 堆上的 WaitGroup
+#[repr(C)]
+pub struct HeapWaitGroup {
+    pub header: HeapObject,
+    pub state: Arc<WaitGroupState>,
 }
 
 // ============================================================================
@@ -313,7 +356,7 @@ impl Value {
     
     /// 创建函数值
     #[inline]
-    pub fn function(f: Rc<Function>) -> Self {
+    pub fn function(f: Arc<Function>) -> Self {
         let boxed = Box::new(HeapFunction {
             header: HeapObject { tag: HeapTag::Function },
             data: f,
@@ -324,7 +367,7 @@ impl Value {
     
     /// 创建数组值
     #[inline]
-    pub fn array(arr: Rc<RefCell<Vec<Value>>>) -> Self {
+    pub fn array(arr: Arc<Mutex<Vec<Value>>>) -> Self {
         let boxed = Box::new(HeapArray {
             header: HeapObject { tag: HeapTag::Array },
             data: arr,
@@ -335,7 +378,7 @@ impl Value {
     
     /// 创建 Map 值
     #[inline]
-    pub fn map(m: Rc<RefCell<HashMap<String, Value>>>) -> Self {
+    pub fn map(m: Arc<Mutex<HashMap<String, Value>>>) -> Self {
         let boxed = Box::new(HeapMap {
             header: HeapObject { tag: HeapTag::Map },
             data: m,
@@ -359,7 +402,7 @@ impl Value {
     
     /// 创建迭代器值
     #[inline]
-    pub fn iterator(iter: Rc<RefCell<Iterator>>) -> Self {
+    pub fn iterator(iter: Arc<Mutex<Iterator>>) -> Self {
         let boxed = Box::new(HeapIterator {
             header: HeapObject { tag: HeapTag::Iterator },
             data: iter,
@@ -370,7 +413,7 @@ impl Value {
     
     /// 创建 Struct 值
     #[inline]
-    pub fn struct_val(s: Rc<RefCell<StructInstance>>) -> Self {
+    pub fn struct_val(s: Arc<Mutex<StructInstance>>) -> Self {
         let boxed = Box::new(HeapStruct {
             header: HeapObject { tag: HeapTag::Struct },
             data: s,
@@ -381,7 +424,7 @@ impl Value {
     
     /// 创建 Class 值
     #[inline]
-    pub fn class(c: Rc<RefCell<ClassInstance>>) -> Self {
+    pub fn class(c: Arc<Mutex<ClassInstance>>) -> Self {
         let boxed = Box::new(HeapClass {
             header: HeapObject { tag: HeapTag::Class },
             data: c,
@@ -407,6 +450,39 @@ impl Value {
         let boxed = Box::new(HeapTypeRef {
             header: HeapObject { tag: HeapTag::TypeRef },
             data: name,
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建 Channel 值
+    #[inline]
+    pub fn channel(state: Arc<Mutex<ChannelState>>) -> Self {
+        let boxed = Box::new(HeapChannel {
+            header: HeapObject { tag: HeapTag::Channel },
+            state,
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建 Mutex 值
+    #[inline]
+    pub fn mutex(inner: Arc<Mutex<Value>>) -> Self {
+        let boxed = Box::new(HeapMutex {
+            header: HeapObject { tag: HeapTag::MutexValue },
+            inner,
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建 WaitGroup 值
+    #[inline]
+    pub fn waitgroup(state: Arc<WaitGroupState>) -> Self {
+        let boxed = Box::new(HeapWaitGroup {
+            header: HeapObject { tag: HeapTag::WaitGroup },
+            state,
         });
         let ptr = Box::into_raw(boxed) as u64;
         Value(TAG_PTR | (ptr & PTR_MASK))
@@ -538,6 +614,24 @@ impl Value {
         self.heap_tag() == Some(HeapTag::TypeRef)
     }
     
+    /// 是否是 Channel
+    #[inline]
+    pub fn is_channel(&self) -> bool {
+        self.heap_tag() == Some(HeapTag::Channel)
+    }
+    
+    /// 是否是 Mutex
+    #[inline]
+    pub fn is_mutex(&self) -> bool {
+        self.heap_tag() == Some(HeapTag::MutexValue)
+    }
+    
+    /// 是否是 WaitGroup
+    #[inline]
+    pub fn is_waitgroup(&self) -> bool {
+        self.heap_tag() == Some(HeapTag::WaitGroup)
+    }
+    
     // ========== 值提取 ==========
     
     /// 获取布尔值
@@ -629,7 +723,7 @@ impl Value {
     
     /// 获取函数引用
     #[inline]
-    pub fn as_function(&self) -> Option<&Rc<Function>> {
+    pub fn as_function(&self) -> Option<&Arc<Function>> {
         if self.heap_tag() == Some(HeapTag::Function) {
             let ptr = (self.0 & PTR_MASK) as *const HeapFunction;
             unsafe { Some(&(*ptr).data) }
@@ -640,7 +734,7 @@ impl Value {
     
     /// 获取数组引用
     #[inline]
-    pub fn as_array(&self) -> Option<&Rc<RefCell<Vec<Value>>>> {
+    pub fn as_array(&self) -> Option<&Arc<Mutex<Vec<Value>>>> {
         if self.heap_tag() == Some(HeapTag::Array) {
             let ptr = (self.0 & PTR_MASK) as *const HeapArray;
             unsafe { Some(&(*ptr).data) }
@@ -651,7 +745,7 @@ impl Value {
     
     /// 获取 Map 引用
     #[inline]
-    pub fn as_map(&self) -> Option<&Rc<RefCell<HashMap<String, Value>>>> {
+    pub fn as_map(&self) -> Option<&Arc<Mutex<HashMap<String, Value>>>> {
         if self.heap_tag() == Some(HeapTag::Map) {
             let ptr = (self.0 & PTR_MASK) as *const HeapMap;
             unsafe { Some(&(*ptr).data) }
@@ -673,7 +767,7 @@ impl Value {
     
     /// 获取迭代器引用
     #[inline]
-    pub fn as_iterator(&self) -> Option<&Rc<RefCell<Iterator>>> {
+    pub fn as_iterator(&self) -> Option<&Arc<Mutex<Iterator>>> {
         if self.heap_tag() == Some(HeapTag::Iterator) {
             let ptr = (self.0 & PTR_MASK) as *const HeapIterator;
             unsafe { Some(&(*ptr).data) }
@@ -684,7 +778,7 @@ impl Value {
     
     /// 获取 Struct 引用
     #[inline]
-    pub fn as_struct(&self) -> Option<&Rc<RefCell<StructInstance>>> {
+    pub fn as_struct(&self) -> Option<&Arc<Mutex<StructInstance>>> {
         if self.heap_tag() == Some(HeapTag::Struct) {
             let ptr = (self.0 & PTR_MASK) as *const HeapStruct;
             unsafe { Some(&(*ptr).data) }
@@ -695,11 +789,11 @@ impl Value {
     
     /// 获取 Class 引用
     #[inline]
-    pub fn as_class(&self) -> Option<&Rc<RefCell<ClassInstance>>> {
+    pub fn as_class(&self) -> Option<&Arc<Mutex<ClassInstance>>> {
         if self.heap_tag() == Some(HeapTag::Class) {
             let ptr = (self.0 & PTR_MASK) as *const HeapClass;
             unsafe { Some(&(*ptr).data) }
-                } else {
+        } else {
             None
         }
     }
@@ -721,6 +815,39 @@ impl Value {
         if self.heap_tag() == Some(HeapTag::TypeRef) {
             let ptr = (self.0 & PTR_MASK) as *const HeapTypeRef;
             unsafe { Some(&(*ptr).data) }
+        } else {
+            None
+        }
+    }
+    
+    /// 获取 Channel 引用
+    #[inline]
+    pub fn as_channel(&self) -> Option<&Arc<Mutex<ChannelState>>> {
+        if self.heap_tag() == Some(HeapTag::Channel) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapChannel;
+            unsafe { Some(&(*ptr).state) }
+        } else {
+            None
+        }
+    }
+    
+    /// 获取 Mutex 引用
+    #[inline]
+    pub fn as_mutex(&self) -> Option<&Arc<Mutex<Value>>> {
+        if self.heap_tag() == Some(HeapTag::MutexValue) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapMutex;
+            unsafe { Some(&(*ptr).inner) }
+        } else {
+            None
+        }
+    }
+    
+    /// 获取 WaitGroup 引用
+    #[inline]
+    pub fn as_waitgroup(&self) -> Option<&Arc<WaitGroupState>> {
+        if self.heap_tag() == Some(HeapTag::WaitGroup) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapWaitGroup;
+            unsafe { Some(&(*ptr).state) }
         } else {
             None
         }
@@ -750,10 +877,10 @@ impl Value {
             return !s.is_empty();
         }
         if let Some(arr) = self.as_array() {
-            return !arr.borrow().is_empty();
+            return !arr.lock().is_empty();
         }
         if let Some(m) = self.as_map() {
-            return !m.borrow().is_empty();
+            return !m.lock().is_empty();
         }
         true
     }
@@ -778,6 +905,9 @@ impl Value {
             Some(HeapTag::Enum) => "enum",
             Some(HeapTag::TypeRef) => "type",
             Some(HeapTag::Int64) => "int",
+            Some(HeapTag::Channel) => "channel",
+            Some(HeapTag::MutexValue) => "mutex",
+            Some(HeapTag::WaitGroup) => "waitgroup",
             None => "unknown",
         }
     }
@@ -1086,22 +1216,22 @@ impl PartialEq for Value {
         
         // 数组比较
         if let (Some(a), Some(b)) = (self.as_array(), other.as_array()) {
-            return *a.borrow() == *b.borrow();
+            return *a.lock() == *b.lock();
         }
         
         // Map 比较
         if let (Some(a), Some(b)) = (self.as_map(), other.as_map()) {
-            return *a.borrow() == *b.borrow();
+            return *a.lock() == *b.lock();
         }
         
         // Struct 比较
         if let (Some(a), Some(b)) = (self.as_struct(), other.as_struct()) {
-            return *a.borrow() == *b.borrow();
+            return *a.lock() == *b.lock();
         }
         
         // Class 比较
         if let (Some(a), Some(b)) = (self.as_class(), other.as_class()) {
-            return *a.borrow() == *b.borrow();
+            return *a.lock() == *b.lock();
         }
         
         // Enum 比较
@@ -1149,6 +1279,12 @@ impl fmt::Debug for Value {
             write!(f, "Enum({:?})", e)
         } else if let Some(t) = self.as_type_ref() {
             write!(f, "TypeRef({})", t)
+        } else if self.is_channel() {
+            write!(f, "Channel(...)")
+        } else if self.is_mutex() {
+            write!(f, "Mutex(...)")
+        } else if self.is_waitgroup() {
+            write!(f, "WaitGroup(...)")
         } else {
             write!(f, "Unknown(0x{:016X})", self.0)
         }
@@ -1180,7 +1316,7 @@ impl fmt::Display for Value {
                 write!(f, "<closure>")
             }
         } else if let Some(arr) = self.as_array() {
-            let arr = arr.borrow();
+            let arr = arr.lock();
             write!(f, "[")?;
             for (i, v) in arr.iter().enumerate() {
                 if i > 0 { write!(f, ", ")?; }
@@ -1188,7 +1324,7 @@ impl fmt::Display for Value {
             }
             write!(f, "]")
         } else if let Some(m) = self.as_map() {
-            let m = m.borrow();
+            let m = m.lock();
             write!(f, "{{")?;
             let mut first = true;
             for (k, v) in m.iter() {
@@ -1206,7 +1342,7 @@ impl fmt::Display for Value {
         } else if self.is_iterator() {
             write!(f, "<iterator>")
         } else if let Some(s) = self.as_struct() {
-            let s = s.borrow();
+            let s = s.lock();
             write!(f, "{} {{ ", s.type_name)?;
             let mut first = true;
             for (name, value) in &s.fields {
@@ -1216,7 +1352,7 @@ impl fmt::Display for Value {
             }
             write!(f, " }}")
         } else if let Some(c) = self.as_class() {
-            let c = c.borrow();
+            let c = c.lock();
             write!(f, "{} {{ ", c.class_name)?;
             let mut first = true;
             for (name, value) in &c.fields {
@@ -1240,6 +1376,12 @@ impl fmt::Display for Value {
             }
         } else if let Some(name) = self.as_type_ref() {
             write!(f, "<type {}>", name)
+        } else if self.is_channel() {
+            write!(f, "<channel>")
+        } else if self.is_mutex() {
+            write!(f, "<mutex>")
+        } else if self.is_waitgroup() {
+            write!(f, "<waitgroup>")
         } else {
             write!(f, "<unknown>")
         }
