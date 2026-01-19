@@ -12,6 +12,7 @@ crossbeam-deque = "0.8"
 crossbeam-utils = "0.8"
 crossbeam-channel = "0.5"
 num_cpus = "1.16"
+dashmap = "5.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

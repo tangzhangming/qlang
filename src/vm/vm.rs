@@ -128,6 +128,12 @@ pub struct VM {
     static_fields: std::collections::HashMap<String, Value>,
     /// VTable 注册表（用于虚方法派发）
     vtable_registry: super::vtable::VTableRegistry,
+    /// 抢占标志（用于协程调度）
+    /// 当调度器需要抢占当前协程时设置为 true
+    preempt_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 内联缓存（方法调用优化）
+    /// 缓存 (类型名, 方法名) -> 函数索引
+    inline_cache: std::collections::HashMap<(String, String), u16>,
 }
 
 impl VM {
@@ -143,7 +149,118 @@ impl VM {
             current_base: 0,
             static_fields: std::collections::HashMap::new(),
             vtable_registry: super::vtable::VTableRegistry::new(),
+            preempt_flag: None,
+            inline_cache: std::collections::HashMap::with_capacity(64),
         }
+    }
+    
+    /// 创建带抢占支持的虚拟机
+    pub fn with_preempt(chunk: Arc<Chunk>, locale: Locale, preempt_flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            chunk,
+            ip: 0,
+            stack: Vec::with_capacity(STACK_SIZE),
+            frames: Vec::with_capacity(MAX_FRAMES),
+            exception_handlers: Vec::new(),
+            locale,
+            current_base: 0,
+            static_fields: std::collections::HashMap::new(),
+            vtable_registry: super::vtable::VTableRegistry::new(),
+            preempt_flag: Some(preempt_flag),
+            inline_cache: std::collections::HashMap::with_capacity(64),
+        }
+    }
+    
+    /// 设置抢占标志
+    pub fn set_preempt_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.preempt_flag = Some(flag);
+    }
+    
+    /// 检查是否需要抢占
+    #[inline]
+    pub fn should_preempt(&self) -> bool {
+        self.preempt_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+    
+    /// 请求抢占
+    pub fn request_preempt(&self) {
+        if let Some(flag) = &self.preempt_flag {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    
+    /// 清除抢占标志
+    pub fn clear_preempt(&self) {
+        if let Some(flag) = &self.preempt_flag {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    
+    /// 查找方法（带内联缓存）
+    /// 
+    /// 缓存 (类型名, 方法名) -> 函数索引 的映射，避免重复查找
+    #[inline]
+    pub fn lookup_method_cached(&mut self, type_name: &str, method_name: &str) -> Option<u16> {
+        let cache_key = (type_name.to_string(), method_name.to_string());
+        
+        // 先查缓存
+        if let Some(&func_index) = self.inline_cache.get(&cache_key) {
+            return Some(func_index);
+        }
+        
+        // 缓存未命中，查找类型信息
+        if let Some(type_info) = self.chunk.get_type(type_name) {
+            if let Some(&method_index) = type_info.methods.get(method_name) {
+                // 缓存结果
+                self.inline_cache.insert(cache_key, method_index);
+                return Some(method_index);
+            }
+        }
+        
+        None
+    }
+    
+    /// 清除内联缓存
+    pub fn clear_inline_cache(&mut self) {
+        self.inline_cache.clear();
+    }
+    
+    // ========== GC 根集扫描支持 ==========
+    
+    /// 扫描 VM 栈上的所有根引用
+    /// 
+    /// 用于垃圾回收器标记阶段，遍历所有可能包含引用的值
+    pub fn scan_gc_roots<F>(&self, mut callback: F) 
+    where
+        F: FnMut(&Value),
+    {
+        // 扫描值栈
+        for value in &self.stack {
+            callback(value);
+        }
+        
+        // 扫描静态字段
+        for value in self.static_fields.values() {
+            callback(value);
+        }
+    }
+    
+    /// 获取栈上所有活跃引用的迭代器
+    pub fn stack_roots(&self) -> impl std::iter::Iterator<Item = &Value> {
+        self.stack.iter()
+    }
+    
+    /// 获取当前栈深度
+    pub fn stack_depth(&self) -> usize {
+        self.stack.len()
+    }
+    
+    /// 获取当前调用帧数量
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
     }
     
     /// 创建同步版本的虚拟机（别名，保持兼容）
@@ -324,6 +441,9 @@ impl VM {
         const OP_RETURN: u8 = 82;
         const OP_CONST: u8 = 0;
         const OP_HALT: u8 = 255;
+        
+        // 抢占式调度：安全点检查仅在跳转/调用指令处进行（向后跳转表示循环）
+        // 这样避免在热路径上增加开销
         
         loop {
             let op = self.read_byte();
@@ -961,6 +1081,128 @@ impl VM {
                     self.push(Value::map(Arc::new(Mutex::new(map))));
                 }
                 
+                OpCode::NewSet => {
+                    // 创建新 Set
+                    let count = self.read_u16() as usize;
+                    let mut elements = Vec::with_capacity(count);
+                    // 从栈上弹出元素
+                    for _ in 0..count {
+                        let value = self.pop()?;
+                        // 检查是否已存在（Set 去重）
+                        if !elements.iter().any(|v| v == &value) {
+                            elements.push(value);
+                        }
+                    }
+                    elements.reverse(); // 恢复正确顺序
+                    self.push(Value::set(Arc::new(Mutex::new(elements))));
+                }
+                
+                OpCode::SetAdd => {
+                    // Set 添加元素
+                    let value = self.pop()?;
+                    let set_val = self.pop()?;
+                    if let Some(set) = set_val.as_set() {
+                        let mut set = set.lock();
+                        // 检查是否已存在
+                        if !set.iter().any(|v| v == &value) {
+                            set.push(value);
+                        }
+                        drop(set);
+                        self.push(set_val);
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot call add on non-set type: {}",
+                            set_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::SetContains => {
+                    // Set 包含检查
+                    let value = self.pop()?;
+                    let set_val = self.pop()?;
+                    if let Some(set) = set_val.as_set() {
+                        let set = set.lock();
+                        let contains = set.iter().any(|v| v == &value);
+                        self.push(Value::bool(contains));
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot call contains on non-set type: {}",
+                            set_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::SetRemove => {
+                    // Set 移除元素
+                    let value = self.pop()?;
+                    let set_val = self.pop()?;
+                    if let Some(set) = set_val.as_set() {
+                        let mut set = set.lock();
+                        let pos = set.iter().position(|v| v == &value);
+                        let removed = if let Some(idx) = pos {
+                            set.remove(idx);
+                            true
+                        } else {
+                            false
+                        };
+                        self.push(Value::bool(removed));
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot call remove on non-set type: {}",
+                            set_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::SetSize => {
+                    // Set 大小
+                    let set_val = self.pop()?;
+                    if let Some(set) = set_val.as_set() {
+                        let set = set.lock();
+                        self.push(Value::int(set.len() as i64));
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot get size of non-set type: {}",
+                            set_val.type_name()
+                        )));
+                    }
+                }
+                
+                OpCode::ArraySlice => {
+                    // 创建数组切片
+                    let end = self.pop()?.as_int().unwrap_or(0) as usize;
+                    let start = self.pop()?.as_int().unwrap_or(0) as usize;
+                    let array_val = self.pop()?;
+                    
+                    if let Some(arr) = array_val.as_array() {
+                        let arr_len = arr.lock().len();
+                        // 边界检查
+                        let actual_start = start.min(arr_len);
+                        let actual_end = end.min(arr_len);
+                        if actual_start <= actual_end {
+                            self.push(Value::array_slice(arr.clone(), actual_start, actual_end));
+                        } else {
+                            // 无效范围，返回空数组
+                            self.push(Value::array(Arc::new(Mutex::new(Vec::new()))));
+                        }
+                    } else if let Some((source, slice_start, slice_end)) = array_val.as_array_slice() {
+                        // 切片的切片
+                        let actual_start = (slice_start + start).min(slice_end);
+                        let actual_end = (slice_start + end).min(slice_end);
+                        if actual_start <= actual_end {
+                            self.push(Value::array_slice(source.clone(), actual_start, actual_end));
+                        } else {
+                            self.push(Value::array(Arc::new(Mutex::new(Vec::new()))));
+                        }
+                    } else {
+                        return Err(self.runtime_error(&format!(
+                            "Cannot slice non-array type: {}",
+                            array_val.type_name()
+                        )));
+                    }
+                }
+                
                 OpCode::GetIndex => {
                     let index = self.pop()?;
                     let object = self.pop()?;
@@ -1191,6 +1433,11 @@ impl VM {
                 }
                 
                 OpCode::Loop => {
+                    // 安全点：向后跳转（循环）是抢占检查点
+                    if self.should_preempt() {
+                        // 可以在这里让出 CPU，但对于单线程 VM 我们只是清除标志
+                        self.clear_preempt();
+                    }
                     let offset = self.read_u16() as usize;
                     self.ip -= offset;
                 }
@@ -3682,6 +3929,341 @@ impl VM {
                     self.push_fast(Value::null());
                 }
                 
+                // ============ Select 指令 ============
+                OpCode::SelectBegin => {
+                    // 创建 select builder（使用数组存储 cases）
+                    let _case_count = self.read_byte();
+                    let cases: Vec<Value> = Vec::new();
+                    self.push(Value::array(Arc::new(Mutex::new(cases))));
+                }
+                
+                OpCode::SelectAddSend => {
+                    // 添加发送 case
+                    // 栈: [..., builder, channel, value]
+                    let value = self.pop()?;
+                    let channel = self.pop()?;
+                    let builder = self.pop()?;
+                    
+                    if let Some(arr) = builder.as_array() {
+                        let mut arr = arr.lock();
+                        // 存储 case 类型 (0=send), channel, value
+                        arr.push(Value::int(0)); // type: send
+                        arr.push(channel);
+                        arr.push(value);
+                        drop(arr);
+                        self.push(builder);
+                    } else {
+                        return Err(self.runtime_error("Invalid select builder"));
+                    }
+                }
+                
+                OpCode::SelectAddRecv => {
+                    // 添加接收 case
+                    // 栈: [..., builder, channel]
+                    let channel = self.pop()?;
+                    let builder = self.pop()?;
+                    
+                    if let Some(arr) = builder.as_array() {
+                        let mut arr = arr.lock();
+                        // 存储 case 类型 (1=recv), channel
+                        arr.push(Value::int(1)); // type: recv
+                        arr.push(channel);
+                        arr.push(Value::null()); // placeholder
+                        drop(arr);
+                        self.push(builder);
+                    } else {
+                        return Err(self.runtime_error("Invalid select builder"));
+                    }
+                }
+                
+                OpCode::SelectAddDefault => {
+                    // 添加 default case
+                    let builder = self.pop()?;
+                    
+                    if let Some(arr) = builder.as_array() {
+                        let mut arr = arr.lock();
+                        arr.push(Value::int(2)); // type: default
+                        arr.push(Value::null()); // placeholder
+                        arr.push(Value::null()); // placeholder
+                        drop(arr);
+                        self.push(builder);
+                    } else {
+                        return Err(self.runtime_error("Invalid select builder"));
+                    }
+                }
+                
+                OpCode::SelectExec => {
+                    use crossbeam_channel::{select, Sender, Receiver};
+                    use std::sync::atomic::Ordering;
+                    
+                    let builder = self.pop()?;
+                    
+                    if let Some(arr) = builder.as_array() {
+                        let arr = arr.lock();
+                        
+                        // 收集所有 cases 的信息
+                        struct CaseInfo {
+                            case_type: i64, // 0=send, 1=recv, 2=default
+                            sender: Option<Sender<Value>>,
+                            receiver: Option<Receiver<Value>>,
+                            value: Option<Value>,
+                            closed: bool,
+                        }
+                        
+                        let mut cases_info: Vec<CaseInfo> = Vec::new();
+                        let mut default_idx: Option<usize> = None;
+                        
+                        let mut i = 0;
+                        while i + 2 < arr.len() {
+                            let case_type = arr[i].as_int().unwrap_or(0);
+                            match case_type {
+                                0 => {
+                                    // Send
+                                    if let Some(ch) = arr[i + 1].as_channel() {
+                                        let state = ch.lock();
+                                        let sender = state.sender.lock().clone();
+                                        let closed = state.closed.load(Ordering::Acquire);
+                                        cases_info.push(CaseInfo {
+                                            case_type: 0,
+                                            sender,
+                                            receiver: None,
+                                            value: Some(arr[i + 2].clone()),
+                                            closed,
+                                        });
+                                    }
+                                }
+                                1 => {
+                                    // Recv
+                                    if let Some(ch) = arr[i + 1].as_channel() {
+                                        let state = ch.lock();
+                                        let receiver = state.receiver.lock().clone();
+                                        let closed = state.closed.load(Ordering::Acquire);
+                                        cases_info.push(CaseInfo {
+                                            case_type: 1,
+                                            sender: None,
+                                            receiver,
+                                            value: None,
+                                            closed,
+                                        });
+                                    }
+                                }
+                                2 => {
+                                    // Default
+                                    default_idx = Some(cases_info.len());
+                                    cases_info.push(CaseInfo {
+                                        case_type: 2,
+                                        sender: None,
+                                        receiver: None,
+                                        value: None,
+                                        closed: false,
+                                    });
+                                }
+                                _ => {}
+                            }
+                            i += 3;
+                        }
+                        drop(arr);
+                        
+                        // 简单实现：轮询检查可用的 case
+                        let mut result_type = -1i64;
+                        let mut result_idx = -1i64;
+                        let mut result_value = Value::null();
+                        
+                        // 首先尝试非阻塞操作
+                        for (idx, case) in cases_info.iter().enumerate() {
+                            match case.case_type {
+                                0 => {
+                                    // Try send
+                                    if !case.closed {
+                                        if let (Some(sender), Some(val)) = (&case.sender, &case.value) {
+                                            if let Ok(()) = sender.try_send(val.clone()) {
+                                                result_type = 0;
+                                                result_idx = idx as i64;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                1 => {
+                                    // Try recv
+                                    if let Some(receiver) = &case.receiver {
+                                        match receiver.try_recv() {
+                                            Ok(val) => {
+                                                result_type = 1;
+                                                result_idx = idx as i64;
+                                                result_value = val;
+                                                break;
+                                            }
+                                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                                result_type = 2; // closed
+                                                result_idx = idx as i64;
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        
+                        // 如果没有成功且有 default，执行 default
+                        if result_type == -1 {
+                            if let Some(idx) = default_idx {
+                                result_type = 3;
+                                result_idx = idx as i64;
+                            } else {
+                                // 没有 default，需要阻塞等待
+                                // 使用简单的轮询
+                                'outer: loop {
+                                    for (idx, case) in cases_info.iter().enumerate() {
+                                        match case.case_type {
+                                            0 => {
+                                                if !case.closed {
+                                                    if let (Some(sender), Some(val)) = (&case.sender, &case.value) {
+                                                        if let Ok(()) = sender.try_send(val.clone()) {
+                                                            result_type = 0;
+                                                            result_idx = idx as i64;
+                                                            break 'outer;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            1 => {
+                                                if let Some(receiver) = &case.receiver {
+                                                    match receiver.try_recv() {
+                                                        Ok(val) => {
+                                                            result_type = 1;
+                                                            result_idx = idx as i64;
+                                                            result_value = val;
+                                                            break 'outer;
+                                                        }
+                                                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                                            result_type = 2;
+                                                            result_idx = idx as i64;
+                                                            break 'outer;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    
+                                    // 检查是否所有 channel 都关闭
+                                    let all_closed = cases_info.iter().all(|c| {
+                                        c.case_type == 2 || c.closed || 
+                                        (c.case_type == 1 && c.receiver.as_ref().map(|r| r.is_empty() && r.len() == 0).unwrap_or(true))
+                                    });
+                                    
+                                    if all_closed {
+                                        result_type = 4; // all_closed
+                                        break;
+                                    }
+                                    
+                                    std::thread::sleep(std::time::Duration::from_micros(10));
+                                }
+                            }
+                        }
+                        
+                        self.push(Value::int(result_type));
+                        self.push(Value::int(result_idx));
+                        self.push(result_value);
+                    } else {
+                        return Err(self.runtime_error("Invalid select builder"));
+                    }
+                }
+                
+                OpCode::SelectTryExec => {
+                    use std::sync::atomic::Ordering;
+                    
+                    let builder = self.pop()?;
+                    
+                    if let Some(arr) = builder.as_array() {
+                        let arr = arr.lock();
+                        
+                        let mut result_type = -1i64;
+                        let mut result_idx = -1i64;
+                        let mut result_value = Value::null();
+                        let mut default_idx: Option<usize> = None;
+                        
+                        let mut i = 0;
+                        let mut case_idx = 0usize;
+                        while i + 2 < arr.len() {
+                            let case_type = arr[i].as_int().unwrap_or(0);
+                            match case_type {
+                                0 => {
+                                    // Try send
+                                    if let Some(ch) = arr[i + 1].as_channel() {
+                                        let state = ch.lock();
+                                        let closed = state.closed.load(Ordering::Acquire);
+                                        let sender = state.sender.lock().clone();
+                                        drop(state);
+                                        if !closed {
+                                            if let Some(ref s) = sender {
+                                                if let Ok(()) = s.try_send(arr[i + 2].clone()) {
+                                                    result_type = 0;
+                                                    result_idx = case_idx as i64;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                1 => {
+                                    // Try recv
+                                    if let Some(ch) = arr[i + 1].as_channel() {
+                                        let state = ch.lock();
+                                        let receiver = state.receiver.lock().clone();
+                                        drop(state);
+                                        if let Some(ref r) = receiver {
+                                            match r.try_recv() {
+                                                Ok(val) => {
+                                                    result_type = 1;
+                                                    result_idx = case_idx as i64;
+                                                    result_value = val;
+                                                }
+                                                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                                    result_type = 2;
+                                                    result_idx = case_idx as i64;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                2 => {
+                                    // Default
+                                    default_idx = Some(case_idx);
+                                }
+                                _ => {}
+                            }
+                            
+                            if result_type != -1 {
+                                break;
+                            }
+                            
+                            i += 3;
+                            case_idx += 1;
+                        }
+                        drop(arr);
+                        
+                        // 如果没有成功且有 default，执行 default
+                        if result_type == -1 {
+                            if let Some(idx) = default_idx {
+                                result_type = 3;
+                                result_idx = idx as i64;
+                            }
+                        }
+                        
+                        self.push(Value::int(result_type));
+                        self.push(Value::int(result_idx));
+                        self.push(result_value);
+                    } else {
+                        return Err(self.runtime_error("Invalid select builder"));
+                    }
+                }
+                
                 // ============ 专用整数指令 (性能优化) ============
                 OpCode::AddInt => {
                     // 无类型检查的整数加法
@@ -4386,6 +4968,10 @@ impl VM {
                 }
             }
             OpCode::Loop => {
+                // 安全点：向后跳转（循环）是抢占检查点
+                if self.should_preempt() {
+                    self.clear_preempt();
+                }
                 let offset = self.read_u16() as usize;
                 self.ip -= offset;
             }

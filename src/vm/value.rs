@@ -16,9 +16,61 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use dashmap::DashMap;
+use std::sync::OnceLock;
+
+// ============================================================================
+// GC 集成
+// ============================================================================
+
+/// GC 是否启用（默认禁用，以保持最佳性能）
+static GC_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 启用 GC
+#[inline]
+pub fn enable_gc() {
+    GC_ENABLED.store(true, Ordering::Release);
+}
+
+/// 禁用 GC
+#[inline]
+pub fn disable_gc() {
+    GC_ENABLED.store(false, Ordering::Release);
+}
+
+/// 检查 GC 是否启用
+#[inline]
+pub fn is_gc_enabled() -> bool {
+    GC_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 注册堆对象到 GC（如果启用）
+#[inline(always)]
+fn gc_register_object(ptr: u64, tag: HeapTag, size: usize) {
+    if GC_ENABLED.load(Ordering::Relaxed) {
+        super::gc::gc_register(ptr, tag, size);
+    }
+}
+
+// ============================================================================
+// 字符串驻留池 (String Interning)
+// ============================================================================
+
+/// 全局字符串池
+/// 使用 DashMap 实现线程安全的并发访问
+static STRING_POOL: OnceLock<DashMap<String, u64>> = OnceLock::new();
+
+/// 获取字符串池实例
+#[inline]
+fn get_string_pool() -> &'static DashMap<String, u64> {
+    STRING_POOL.get_or_init(|| DashMap::with_capacity(1024))
+}
+
+/// 字符串驻留阈值（超过此长度的字符串不进行驻留）
+const INTERN_THRESHOLD: usize = 64;
 
 // ============================================================================
 // NaN-Boxing 常量定义
@@ -83,6 +135,8 @@ pub enum HeapTag {
     Channel = 11,
     MutexValue = 12,
     WaitGroup = 13,
+    Set = 14,
+    ArraySlice = 15,
 }
 
 /// 堆对象头部
@@ -164,11 +218,35 @@ pub struct HeapArray {
     pub data: Arc<Mutex<Vec<Value>>>,
 }
 
+/// 堆上的数组切片（视图）
+/// 
+/// 不复制数据，只引用原数组的一个范围
+#[repr(C)]
+pub struct HeapArraySlice {
+    pub header: HeapObject,
+    /// 原数组
+    pub source: Arc<Mutex<Vec<Value>>>,
+    /// 起始索引（包含）
+    pub start: usize,
+    /// 结束索引（不包含）
+    pub end: usize,
+}
+
 /// 堆上的 Map
 #[repr(C)]
 pub struct HeapMap {
     pub header: HeapObject,
     pub data: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+/// 堆上的 Set（集合）
+/// 
+/// 使用 Vec<Value> 实现，通过 PartialEq 进行元素去重
+/// 对于小集合效率足够，大集合考虑使用更高效的数据结构
+#[repr(C)]
+pub struct HeapSet {
+    pub header: HeapObject,
+    pub data: Arc<Mutex<Vec<Value>>>,
 }
 
 /// 迭代器数据源
@@ -338,6 +416,7 @@ impl Value {
                 value: n,
             });
             let ptr = Box::into_raw(boxed) as u64;
+            gc_register_object(ptr, HeapTag::Int64, std::mem::size_of::<HeapInt64>());
             Value(TAG_INT64 | (ptr & PTR_MASK))
         }
     }
@@ -354,14 +433,56 @@ impl Value {
         Value(TAG_CHAR | (c as u32 as u64))
     }
     
-    /// 创建字符串值
+    /// 创建字符串值（带字符串驻留优化）
+    /// 
+    /// 短字符串（<=64字节）会被驻留到全局字符串池中，
+    /// 相同内容的字符串只存储一份，提高内存效率和比较速度
     #[inline]
     pub fn string(s: String) -> Self {
+        // 短字符串进行驻留
+        if s.len() <= INTERN_THRESHOLD {
+            let pool = get_string_pool();
+            
+            // 先检查是否已存在
+            if let Some(ptr) = pool.get(&s) {
+                return Value(TAG_PTR | (*ptr & PTR_MASK));
+            }
+            
+            // 不存在则创建并插入
+            let str_len = s.len();
+            let boxed = Box::new(HeapString {
+                header: HeapObject { tag: HeapTag::String },
+                data: s.clone(),
+            });
+            let ptr = Box::into_raw(boxed) as u64;
+            gc_register_object(ptr, HeapTag::String, std::mem::size_of::<HeapString>() + str_len);
+            pool.insert(s, ptr);
+            Value(TAG_PTR | (ptr & PTR_MASK))
+        } else {
+            // 长字符串不驻留
+            let str_len = s.len();
+            let boxed = Box::new(HeapString {
+                header: HeapObject { tag: HeapTag::String },
+                data: s,
+            });
+            let ptr = Box::into_raw(boxed) as u64;
+            gc_register_object(ptr, HeapTag::String, std::mem::size_of::<HeapString>() + str_len);
+            Value(TAG_PTR | (ptr & PTR_MASK))
+        }
+    }
+    
+    /// 创建字符串值（不进行驻留）
+    /// 
+    /// 用于确定不需要驻留的场景（如临时字符串拼接）
+    #[inline]
+    pub fn string_uninterned(s: String) -> Self {
+        let str_len = s.len();
         let boxed = Box::new(HeapString {
             header: HeapObject { tag: HeapTag::String },
             data: s,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::String, std::mem::size_of::<HeapString>() + str_len);
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -373,6 +494,7 @@ impl Value {
             data: f,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Function, std::mem::size_of::<HeapFunction>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -384,6 +506,23 @@ impl Value {
             data: arr,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Array, std::mem::size_of::<HeapArray>());
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建数组切片（视图）
+    /// 
+    /// 不复制数据，只创建一个指向原数组范围的视图
+    #[inline]
+    pub fn array_slice(source: Arc<Mutex<Vec<Value>>>, start: usize, end: usize) -> Self {
+        let boxed = Box::new(HeapArraySlice {
+            header: HeapObject { tag: HeapTag::ArraySlice },
+            source,
+            start,
+            end,
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::ArraySlice, std::mem::size_of::<HeapArraySlice>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -395,7 +534,26 @@ impl Value {
             data: m,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Map, std::mem::size_of::<HeapMap>());
         Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建 Set 值
+    #[inline]
+    pub fn set(s: Arc<Mutex<Vec<Value>>>) -> Self {
+        let boxed = Box::new(HeapSet {
+            header: HeapObject { tag: HeapTag::Set },
+            data: s,
+        });
+        let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Set, std::mem::size_of::<HeapSet>());
+        Value(TAG_PTR | (ptr & PTR_MASK))
+    }
+    
+    /// 创建空 Set
+    #[inline]
+    pub fn empty_set() -> Self {
+        Self::set(Arc::new(Mutex::new(Vec::new())))
     }
     
     /// 创建 Range 值
@@ -408,6 +566,7 @@ impl Value {
             inclusive,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Range, std::mem::size_of::<HeapRange>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -419,6 +578,7 @@ impl Value {
             data: iter,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Iterator, std::mem::size_of::<HeapIterator>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -430,6 +590,7 @@ impl Value {
             data: s,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Struct, std::mem::size_of::<HeapStruct>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -441,6 +602,7 @@ impl Value {
             data: c,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Class, std::mem::size_of::<HeapClass>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -452,17 +614,20 @@ impl Value {
             data: e,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Enum, std::mem::size_of::<HeapEnum>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
     /// 创建类型引用值
     #[inline]
     pub fn type_ref(name: String) -> Self {
+        let name_len = name.len();
         let boxed = Box::new(HeapTypeRef {
             header: HeapObject { tag: HeapTag::TypeRef },
             data: name,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::TypeRef, std::mem::size_of::<HeapTypeRef>() + name_len);
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -474,6 +639,7 @@ impl Value {
             state,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::Channel, std::mem::size_of::<HeapChannel>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -485,6 +651,7 @@ impl Value {
             inner,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::MutexValue, std::mem::size_of::<HeapMutex>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -496,6 +663,7 @@ impl Value {
             state,
         });
         let ptr = Box::into_raw(boxed) as u64;
+        gc_register_object(ptr, HeapTag::WaitGroup, std::mem::size_of::<HeapWaitGroup>());
         Value(TAG_PTR | (ptr & PTR_MASK))
     }
     
@@ -552,7 +720,7 @@ impl Value {
     
     /// 获取堆对象标签
     #[inline]
-    fn heap_tag(&self) -> Option<HeapTag> {
+    pub fn heap_tag(&self) -> Option<HeapTag> {
         if self.is_ptr() {
             let ptr = (self.0 & PTR_MASK) as *const HeapObject;
             if !ptr.is_null() {
@@ -562,6 +730,30 @@ impl Value {
             }
         } else {
             None
+        }
+    }
+    
+    /// 检查是否是 Int64 堆对象
+    #[inline]
+    fn is_boxed_int64(&self) -> bool {
+        (self.0 & (QNAN | TAG_MASK)) == TAG_INT64
+    }
+    
+    /// 检查是否是堆对象
+    #[inline]
+    pub fn is_heap_object(&self) -> bool {
+        self.is_ptr() || self.is_boxed_int64()
+    }
+    
+    /// 获取对象指针（用于 GC）
+    #[inline]
+    pub fn as_ptr(&self) -> u64 {
+        if self.is_ptr() {
+            self.0 & PTR_MASK
+        } else if self.is_boxed_int64() {
+            self.0 & PTR_MASK
+        } else {
+            0
         }
     }
     
@@ -754,11 +946,140 @@ impl Value {
         }
     }
     
+    /// 获取数组切片引用
+    #[inline]
+    pub fn as_array_slice(&self) -> Option<(&Arc<Mutex<Vec<Value>>>, usize, usize)> {
+        if self.heap_tag() == Some(HeapTag::ArraySlice) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapArraySlice;
+            unsafe { Some((&(*ptr).source, (*ptr).start, (*ptr).end)) }
+        } else {
+            None
+        }
+    }
+    
+    /// 检查是否是数组或数组切片
+    #[inline]
+    pub fn is_array_like(&self) -> bool {
+        matches!(self.heap_tag(), Some(HeapTag::Array) | Some(HeapTag::ArraySlice))
+    }
+    
+    /// 获取数组元素（支持数组和切片）
+    /// 
+    /// 对于切片，索引是相对于切片起始位置的
+    pub fn array_get(&self, index: usize) -> Option<Value> {
+        if let Some(arr) = self.as_array() {
+            let arr = arr.lock();
+            arr.get(index).cloned()
+        } else if let Some((source, start, end)) = self.as_array_slice() {
+            let arr = source.lock();
+            let actual_index = start + index;
+            if actual_index < end && actual_index < arr.len() {
+                arr.get(actual_index).cloned()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// 获取数组长度（支持数组和切片）
+    pub fn array_len(&self) -> Option<usize> {
+        if let Some(arr) = self.as_array() {
+            Some(arr.lock().len())
+        } else if let Some((_, start, end)) = self.as_array_slice() {
+            Some(end - start)
+        } else {
+            None
+        }
+    }
+    
+    /// COW 写入数组元素
+    /// 
+    /// 如果数组被共享（引用计数 > 1），先复制再写入
+    /// 返回是否成功写入
+    pub fn array_set_cow(&mut self, index: usize, value: Value) -> bool {
+        if let Some(arr) = self.as_array() {
+            // 检查是否需要 COW
+            if Arc::strong_count(arr) > 1 {
+                // 需要复制
+                let cloned = {
+                    let guard = arr.lock();
+                    guard.clone()
+                };
+                let new_arr = Arc::new(Mutex::new(cloned));
+                
+                // 写入新数组
+                {
+                    let mut guard = new_arr.lock();
+                    if index < guard.len() {
+                        guard[index] = value;
+                    } else {
+                        return false;
+                    }
+                }
+                
+                // 替换为新数组
+                *self = Value::array(new_arr);
+                true
+            } else {
+                // 直接写入
+                let mut guard = arr.lock();
+                if index < guard.len() {
+                    guard[index] = value;
+                    true
+                } else {
+                    false
+                }
+            }
+        } else if let Some((source, start, end)) = self.as_array_slice() {
+            // 切片写入：总是需要创建新数组（因为切片是只读视图）
+            let actual_index = start + index;
+            if actual_index >= end {
+                return false;
+            }
+            
+            // 将切片转换为独立数组
+            let cloned = {
+                let guard = source.lock();
+                guard[start..end].to_vec()
+            };
+            let new_arr = Arc::new(Mutex::new(cloned));
+            
+            // 写入
+            {
+                let mut guard = new_arr.lock();
+                if index < guard.len() {
+                    guard[index] = value;
+                } else {
+                    return false;
+                }
+            }
+            
+            // 替换为新数组
+            *self = Value::array(new_arr);
+            true
+        } else {
+            false
+        }
+    }
+    
     /// 获取 Map 引用
     #[inline]
     pub fn as_map(&self) -> Option<&Arc<Mutex<HashMap<String, Value>>>> {
         if self.heap_tag() == Some(HeapTag::Map) {
             let ptr = (self.0 & PTR_MASK) as *const HeapMap;
+            unsafe { Some(&(*ptr).data) }
+        } else {
+            None
+        }
+    }
+    
+    /// 获取 Set 值
+    #[inline]
+    pub fn as_set(&self) -> Option<&Arc<Mutex<Vec<Value>>>> {
+        if self.heap_tag() == Some(HeapTag::Set) {
+            let ptr = (self.0 & PTR_MASK) as *const HeapSet;
             unsafe { Some(&(*ptr).data) }
         } else {
             None
@@ -908,7 +1229,9 @@ impl Value {
             Some(HeapTag::String) => "string",
             Some(HeapTag::Function) => "function",
             Some(HeapTag::Array) => "array",
+            Some(HeapTag::ArraySlice) => "array",  // 切片对外也显示为 array
             Some(HeapTag::Map) => "map",
+            Some(HeapTag::Set) => "set",
             Some(HeapTag::Range) => "range",
             Some(HeapTag::Iterator) => "iterator",
             Some(HeapTag::Struct) => "struct",
@@ -1334,6 +1657,15 @@ impl fmt::Display for Value {
                 write!(f, "{}", v)?;
             }
             write!(f, "]")
+        } else if let Some((source, start, end)) = self.as_array_slice() {
+            // 数组切片：显示切片范围内的元素
+            let arr = source.lock();
+            write!(f, "[")?;
+            for (i, idx) in (start..end.min(arr.len())).enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "{}", arr[idx])?;
+            }
+            write!(f, "]")
         } else if let Some(m) = self.as_map() {
             let m = m.lock();
             write!(f, "{{")?;
@@ -1342,6 +1674,14 @@ impl fmt::Display for Value {
                 if !first { write!(f, ", ")?; }
                 first = false;
                 write!(f, "\"{}\": {}", k, v)?;
+            }
+            write!(f, "}}")
+        } else if let Some(s) = self.as_set() {
+            let s = s.lock();
+            write!(f, "set{{")?;
+            for (i, v) in s.iter().enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "{}", v)?;
             }
             write!(f, "}}")
         } else if let Some((start, end, inclusive)) = self.as_range() {

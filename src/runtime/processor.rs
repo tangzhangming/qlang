@@ -260,6 +260,7 @@ mod tests {
             has_variadic: false,
             chunk_index: 0,
             local_count: 0,
+            upvalues: Vec::new(),
         });
         Arc::new(Goroutine::new(id, func, Vec::new()).unwrap())
     }

@@ -245,6 +245,82 @@ impl Drop for Stack {
 // 但我们通过 Goroutine 的包装来保证安全性
 unsafe impl Send for Stack {}
 
+// ============================================================================
+// 栈扫描支持（为 GC 准备）
+// ============================================================================
+
+/// 栈帧信息
+/// 
+/// 记录一个栈帧的布局，用于 GC 扫描
+#[derive(Debug, Clone)]
+pub struct StackFrameInfo {
+    /// 帧基址偏移（相对于栈底）
+    pub base_offset: usize,
+    /// 帧大小（字节数）
+    pub size: usize,
+    /// 引用槽位（相对于帧基址的偏移，单位是 Value 大小）
+    pub reference_slots: Vec<u16>,
+}
+
+/// 栈扫描上下文
+/// 
+/// 提供给 GC 扫描器的栈状态信息
+pub struct StackScanContext {
+    /// 栈指针
+    pub stack_ptr: *const u8,
+    /// 栈容量
+    pub capacity: usize,
+    /// 栈帧列表（从栈顶到栈底）
+    pub frames: Vec<StackFrameInfo>,
+}
+
+impl StackScanContext {
+    /// 创建新的扫描上下文
+    pub fn new(stack: &Stack) -> Self {
+        Self {
+            stack_ptr: stack.base(),
+            capacity: stack.capacity(),
+            frames: Vec::new(),
+        }
+    }
+    
+    /// 添加帧信息
+    pub fn add_frame(&mut self, info: StackFrameInfo) {
+        self.frames.push(info);
+    }
+    
+    /// 获取所有引用槽位（用于 GC 根集扫描）
+    /// 
+    /// 返回所有活跃帧中的引用槽位地址
+    pub fn scan_roots<F>(&self, mut callback: F) 
+    where
+        F: FnMut(*const u8),
+    {
+        for frame in &self.frames {
+            for &slot_offset in &frame.reference_slots {
+                // 计算槽位的实际地址
+                // 假设每个槽位是 8 字节（Value 的大小）
+                let slot_addr = unsafe {
+                    self.stack_ptr.add(frame.base_offset + slot_offset as usize * 8)
+                };
+                callback(slot_addr);
+            }
+        }
+    }
+}
+
+/// GC 根集扫描器 trait
+/// 
+/// VM 和协程可以实现此 trait 来提供根集扫描功能
+pub trait GcRootScanner {
+    /// 扫描所有 GC 根
+    /// 
+    /// 回调函数会被每个可能包含引用的位置调用
+    fn scan_gc_roots<F>(&self, callback: F) 
+    where
+        F: FnMut(*const u8);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -325,6 +325,204 @@ impl<T: Into<Value> + TryFrom<Value>> Default for TypedChannel<T> {
     }
 }
 
+// ============================================================================
+// Select 多路复用
+// ============================================================================
+
+/// Select case 类型
+#[derive(Clone)]
+pub enum SelectCase {
+    /// 发送操作
+    Send { 
+        channel: Arc<Channel>, 
+        value: Value,
+    },
+    /// 接收操作
+    Recv { 
+        channel: Arc<Channel>,
+    },
+    /// 默认分支（非阻塞）
+    Default,
+}
+
+/// Select 结果
+#[derive(Debug, Clone)]
+pub enum SelectResult {
+    /// 发送成功（返回 case 索引）
+    Sent(usize),
+    /// 接收成功（返回 case 索引和值）
+    Received(usize, Value),
+    /// 接收到关闭的 channel（返回 case 索引）
+    ReceivedClosed(usize),
+    /// 执行了 default 分支（返回 case 索引）
+    Default(usize),
+    /// 所有 channel 都关闭
+    AllClosed,
+}
+
+/// 执行 select 操作（阻塞）
+/// 
+/// Go 风格的多路 Channel 选择。从多个 Channel 操作中选择一个可执行的。
+/// 如果有多个可执行，随机选择一个。如果都不可执行且有 default，执行 default。
+/// 如果都不可执行且没有 default，阻塞等待。
+pub fn select(cases: &[SelectCase]) -> SelectResult {
+    // 首先尝试非阻塞执行
+    if let Some(result) = try_select_once(cases) {
+        return result;
+    }
+    
+    // 没有 default 分支，需要阻塞等待
+    // 使用轮询方式实现（简单但效率较低）
+    // TODO: 优化为基于 Condvar 的等待
+    loop {
+        if let Some(result) = try_select_once(cases) {
+            return result;
+        }
+        
+        // 检查是否所有 channel 都关闭
+        let mut all_closed = true;
+        for case in cases {
+            match case {
+                SelectCase::Send { channel, .. } | SelectCase::Recv { channel } => {
+                    if !channel.is_closed() {
+                        all_closed = false;
+                        break;
+                    }
+                }
+                SelectCase::Default => {
+                    all_closed = false;
+                    break;
+                }
+            }
+        }
+        
+        if all_closed {
+            return SelectResult::AllClosed;
+        }
+        
+        // 短暂休眠避免 CPU 空转
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
+}
+
+/// 执行 select 操作（非阻塞）
+/// 
+/// 尝试执行一次 select，如果没有可执行的操作返回 None
+pub fn try_select(cases: &[SelectCase]) -> Option<SelectResult> {
+    try_select_once(cases)
+}
+
+/// 带超时的 select
+/// 
+/// 在指定时间内尝试执行 select，超时返回 None
+pub fn select_timeout(cases: &[SelectCase], timeout: std::time::Duration) -> Option<SelectResult> {
+    let deadline = std::time::Instant::now() + timeout;
+    
+    loop {
+        if let Some(result) = try_select_once(cases) {
+            return Some(result);
+        }
+        
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        
+        // 检查是否所有 channel 都关闭
+        let mut all_closed = true;
+        for case in cases {
+            match case {
+                SelectCase::Send { channel, .. } | SelectCase::Recv { channel } => {
+                    if !channel.is_closed() {
+                        all_closed = false;
+                        break;
+                    }
+                }
+                SelectCase::Default => {
+                    all_closed = false;
+                    break;
+                }
+            }
+        }
+        
+        if all_closed {
+            return Some(SelectResult::AllClosed);
+        }
+        
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
+}
+
+/// 尝试执行一次 select（内部函数）
+fn try_select_once(cases: &[SelectCase]) -> Option<SelectResult> {
+    // 收集可执行的 case 索引
+    let mut ready_cases: Vec<usize> = Vec::new();
+    let mut default_index: Option<usize> = None;
+    
+    for (i, case) in cases.iter().enumerate() {
+        match case {
+            SelectCase::Send { channel, .. } => {
+                if channel.is_closed() {
+                    continue;
+                }
+                // 检查是否可以发送
+                let buffer = channel.buffer.lock();
+                let can_send = channel.capacity == 0 && !channel.recv_waiters.lock().is_empty()
+                    || channel.capacity > 0 && buffer.len() < channel.capacity;
+                drop(buffer);
+                if can_send {
+                    ready_cases.push(i);
+                }
+            }
+            SelectCase::Recv { channel } => {
+                // 检查是否可以接收
+                let buffer = channel.buffer.lock();
+                let has_data = !buffer.is_empty();
+                drop(buffer);
+                if has_data {
+                    ready_cases.push(i);
+                } else if channel.is_closed() {
+                    // Channel 关闭且为空
+                    return Some(SelectResult::ReceivedClosed(i));
+                }
+            }
+            SelectCase::Default => {
+                default_index = Some(i);
+            }
+        }
+    }
+    
+    // 如果有可执行的 case，随机选择一个
+    if !ready_cases.is_empty() {
+        // 简单随机：使用时间戳
+        let idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as usize) % ready_cases.len();
+        let case_idx = ready_cases[idx];
+        
+        match &cases[case_idx] {
+            SelectCase::Send { channel, value } => {
+                if channel.try_send(value.clone()) {
+                    return Some(SelectResult::Sent(case_idx));
+                }
+            }
+            SelectCase::Recv { channel } => {
+                if let Some(value) = channel.try_receive() {
+                    return Some(SelectResult::Received(case_idx, value));
+                }
+            }
+            SelectCase::Default => unreachable!(),
+        }
+    }
+    
+    // 没有可执行的 case，检查是否有 default
+    if let Some(idx) = default_index {
+        return Some(SelectResult::Default(idx));
+    }
+    
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +577,64 @@ mod tests {
         // 仍可接收已缓冲的值
         assert_eq!(ch.try_receive().map(|v| v.as_int()), Some(Some(42)));
         assert!(ch.try_receive().is_none());
+    }
+    
+    #[test]
+    fn test_select_with_default() {
+        let ch1 = Arc::new(Channel::with_capacity(1));
+        let ch2 = Arc::new(Channel::with_capacity(1));
+        
+        // 两个空 channel，应该执行 default
+        let cases = vec![
+            SelectCase::Recv { channel: Arc::clone(&ch1) },
+            SelectCase::Recv { channel: Arc::clone(&ch2) },
+            SelectCase::Default,
+        ];
+        
+        match select(&cases) {
+            SelectResult::Default(idx) => assert_eq!(idx, 2),
+            _ => panic!("Expected Default"),
+        }
+    }
+    
+    #[test]
+    fn test_select_recv() {
+        let ch1 = Arc::new(Channel::with_capacity(1));
+        let ch2 = Arc::new(Channel::with_capacity(1));
+        
+        // 向 ch1 发送数据
+        ch1.try_send(Value::int(42));
+        
+        let cases = vec![
+            SelectCase::Recv { channel: Arc::clone(&ch1) },
+            SelectCase::Recv { channel: Arc::clone(&ch2) },
+        ];
+        
+        match select(&cases) {
+            SelectResult::Received(idx, value) => {
+                assert_eq!(idx, 0);
+                assert_eq!(value.as_int(), Some(42));
+            }
+            _ => panic!("Expected Received"),
+        }
+    }
+    
+    #[test]
+    fn test_select_send() {
+        let ch1 = Arc::new(Channel::with_capacity(1));
+        let ch2 = Arc::new(Channel::with_capacity(0)); // 无缓冲，不能发送
+        
+        let cases = vec![
+            SelectCase::Send { channel: Arc::clone(&ch1), value: Value::int(1) },
+            SelectCase::Send { channel: Arc::clone(&ch2), value: Value::int(2) },
+        ];
+        
+        match select(&cases) {
+            SelectResult::Sent(idx) => assert_eq!(idx, 0),
+            _ => panic!("Expected Sent"),
+        }
+        
+        // 验证数据已发送
+        assert_eq!(ch1.try_receive().map(|v| v.as_int()), Some(Some(1)));
     }
 }

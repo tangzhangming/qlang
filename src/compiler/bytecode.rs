@@ -105,13 +105,31 @@ pub enum OpCode {
     /// [deprecated] 可能在未来版本移除
     Time = 88,
     
-    // ============ 数组和范围和Map ============
+    // ============ 数组和范围和Map和Set ============
     /// 创建数组
     /// 操作数: 元素数量 (u16)
     NewArray = 75,
     /// 创建 Map
     /// 操作数: 键值对数量 (u16)
     NewMap = 87,
+    /// 创建 Set
+    /// 操作数: 元素数量 (u16)
+    NewSet = 160,
+    /// Set 添加元素
+    /// 栈: [..., set, value] -> [..., set]
+    SetAdd = 161,
+    /// Set 包含检查
+    /// 栈: [..., set, value] -> [..., contains:bool]
+    SetContains = 162,
+    /// Set 移除元素
+    /// 栈: [..., set, value] -> [..., removed:bool]
+    SetRemove = 163,
+    /// Set 大小
+    /// 栈: [..., set] -> [..., size:int]
+    SetSize = 164,
+    /// 创建数组切片
+    /// 栈: [..., array, start, end] -> [..., slice]
+    ArraySlice = 171,
     /// 获取数组元素
     GetIndex = 76,
     /// 设置数组元素
@@ -315,6 +333,31 @@ pub enum OpCode {
     /// 栈: [..., wait_group] -> [...]
     WaitGroupWait = 158,
     
+    /// Select 开始
+    /// 操作数: case 数量 (u8)
+    /// 栈: [...] -> [..., select_builder]
+    SelectBegin = 165,
+    
+    /// Select 添加发送 case
+    /// 栈: [..., select_builder, channel, value] -> [..., select_builder]
+    SelectAddSend = 166,
+    
+    /// Select 添加接收 case
+    /// 栈: [..., select_builder, channel] -> [..., select_builder]
+    SelectAddRecv = 167,
+    
+    /// Select 添加 default case
+    /// 栈: [..., select_builder] -> [..., select_builder]
+    SelectAddDefault = 168,
+    
+    /// Select 执行（阻塞）
+    /// 栈: [..., select_builder] -> [..., result_type, case_index, value?]
+    SelectExec = 169,
+    
+    /// Select 尝试执行（非阻塞）
+    /// 栈: [..., select_builder] -> [..., result_type, case_index, value?]
+    SelectTryExec = 170,
+    
     // ============ 控制 ============
     /// 停止执行
     Halt = 255,
@@ -391,6 +434,14 @@ impl From<u8> for OpCode {
             86 => OpCode::TypeCheck,
             87 => OpCode::NewMap,
             88 => OpCode::Time,
+            // Set 指令
+            160 => OpCode::NewSet,
+            161 => OpCode::SetAdd,
+            162 => OpCode::SetContains,
+            163 => OpCode::SetRemove,
+            164 => OpCode::SetSize,
+            // 数组切片
+            171 => OpCode::ArraySlice,
             110 => OpCode::SetupTry,
             111 => OpCode::Throw,
             // 专用整数指令
@@ -428,6 +479,13 @@ impl From<u8> for OpCode {
             156 => OpCode::WaitGroupAdd,
             157 => OpCode::WaitGroupDone,
             158 => OpCode::WaitGroupWait,
+            // Select 指令
+            165 => OpCode::SelectBegin,
+            166 => OpCode::SelectAddSend,
+            167 => OpCode::SelectAddRecv,
+            168 => OpCode::SelectAddDefault,
+            169 => OpCode::SelectExec,
+            170 => OpCode::SelectTryExec,
             255 => OpCode::Halt,
             _ => panic!("Unknown opcode: {}", value),
         }
