@@ -29,6 +29,8 @@ pub struct FunctionInfo {
     pub param_types: Vec<Type>,
     /// 参数名
     pub param_names: Vec<String>,
+    /// 必需参数数量（不包括有默认值的参数）
+    pub required_params: usize,
     /// 返回类型
     pub return_type: Type,
     /// 是否是方法

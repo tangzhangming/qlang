@@ -251,11 +251,11 @@ fn load_source_file(
     
     // 读取文件
     let source = fs::read_to_string(path)
-        .map_err(|e| format!("无法读取文件 {}: {}", display_path(path), e))?;
+        .map_err(|e| format_message(messages::MSG_CLI_CANNOT_READ_FILE, locale, &[&display_path(path), &e.to_string()]))?;
     
     // 解析
     let program = parse_source(&source, locale)
-        .map_err(|e| format!("解析 {} 失败:\n{}", display_path(path), e))?;
+        .map_err(|e| format_message(messages::MSG_CLI_PARSE_FAILED, locale, &[&display_path(path), &e]))?;
     
     // 递归加载依赖
     for import in &program.imports {
@@ -334,7 +334,10 @@ fn run_with_context(
 ) -> Result<(), String> {
     // 解析主程序
     let mut program = parse_source(source, locale)
-        .map_err(|e| format!("[语法错误/Syntax Error]\n{}", e))?;
+        .map_err(|e| {
+            let label = format_message(messages::MSG_CLI_SYNTAX_ERROR, locale, &[]);
+            format!("{}\n{}", label, e)
+        })?;
     
     // 如果有额外的语句（来自依赖），添加到程序开头
     if let Some(mut extra) = extra_statements {
@@ -347,12 +350,13 @@ fn run_with_context(
     if type_check {
         let mut type_checker = TypeChecker::with_context(context);
         type_checker.check_program(&program).map_err(|errors| {
+            let label = format_message(messages::MSG_CLI_TYPE_ERROR, locale, &[]);
             let error_list = errors
                 .iter()
                 .map(|e| format!("  [{}:{}] {}", e.span.line, e.span.column, e))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("[类型检查错误/Type Error]\n{}", error_list)
+            format!("{}\n{}", label, error_list)
         })?;
         
         // 收集泛型定义用于单态化
@@ -366,18 +370,22 @@ fn run_with_context(
     // 编译
     let mut compiler = Compiler::new(locale);
     let chunk = compiler.compile(&program).map_err(|errors| {
+        let label = format_message(messages::MSG_CLI_COMPILE_ERROR, locale, &[]);
         let error_list = errors
             .iter()
             .map(|e| format!("  [{}:{}] {}", e.span.line, e.span.column, e.message))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("[编译错误/Compile Error]\n{}", error_list)
+        format!("{}\n{}", label, error_list)
     })?;
     
     // 执行（从 main 函数开始）
     let chunk_arc = std::sync::Arc::new(chunk);
     let mut vm = VM::new(chunk_arc, locale);
-    vm.run().map_err(|e| format!("[运行时错误/Runtime Error]\n  [line {}] {}", e.line, e.message))?;
+    vm.run().map_err(|e| {
+        let label = format_message(messages::MSG_CLI_RUNTIME_ERROR, locale, &[]);
+        format!("{}\n  [line {}] {}", label, e.line, e.message)
+    })?;
     
     Ok(())
 }
@@ -448,7 +456,8 @@ fn run_file(path: &str, locale: Locale) {
     let main_program = match parse_source(&source, locale) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[语法错误/Syntax Error] {}\n{}", path, e);
+            let label = format_message(messages::MSG_CLI_SYNTAX_ERROR, locale, &[]);
+            eprintln!("{} {}\n{}", label, path, e);
             process::exit(1);
         }
     };
@@ -457,7 +466,8 @@ fn run_file(path: &str, locale: Locale) {
     let extra_statements = match load_dependencies(&main_program, file_path, project.as_ref(), locale) {
         Ok(stmts) => Some(stmts),
         Err(e) => {
-            eprintln!("[导入错误/Import Error]\n  {}", e);
+            let label = format_message(messages::MSG_CLI_IMPORT_ERROR, locale, &[]);
+            eprintln!("{}\n  {}", label, e);
             process::exit(1);
         }
     };

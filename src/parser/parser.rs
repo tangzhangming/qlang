@@ -1231,10 +1231,16 @@ impl Parser {
             if self.check(&TokenKind::Func) {
                 let method = self.parse_class_method(visibility, is_static, is_override, is_method_abstract)?;
                 methods.push(method);
-            } else {
-                // 解析字段
-                let field = self.parse_class_field(visibility, is_static, is_const)?;
+            } else if self.check(&TokenKind::Var) || self.check(&TokenKind::Const) {
+                // 解析字段（必须有 var 或 const 关键字）
+                let is_const_field = self.check(&TokenKind::Const);
+                self.advance(); // 消费 var 或 const
+                let field = self.parse_class_field(visibility, is_static, is_const_field || is_const)?;
                 fields.push(field);
+            } else {
+                // 不是 func、var、const，报错
+                let msg = format_message(messages::ERR_COMPILE_EXPECTED_VAR_OR_FUNC, self.locale, &[]);
+                return Err(ParseError::new(msg, self.current_span()));
             }
         }
         
@@ -1246,6 +1252,14 @@ impl Parser {
         if init_methods.len() > 1 {
             let msg = format_message(messages::ERR_COMPILE_CONSTRUCTOR_OVERLOAD, self.locale, &[]);
             return Err(ParseError::new(msg, init_methods[1].span));
+        }
+        
+        // 检查构造函数可见性（必须是 public）
+        if let Some(init_method) = init_methods.first() {
+            if init_method.visibility != super::ast::Visibility::Public {
+                let msg = format_message(messages::ERR_COMPILE_CONSTRUCTOR_VISIBILITY, self.locale, &[]);
+                return Err(ParseError::new(msg, init_method.span));
+            }
         }
         
         let end_span = self.previous_span();
@@ -2018,8 +2032,9 @@ impl Parser {
         };
         
         Ok(Type::Function {
-            param_types,
+            param_types: param_types.clone(),
             return_type: Box::new(return_type),
+            required_params: param_types.len(), // 类型注解中的函数类型假设所有参数都是必需的
         })
     }
     

@@ -39,6 +39,12 @@ pub enum TypeErrorKind {
         expected: usize,
         actual: usize,
     },
+    /// 参数数量不匹配（带默认参数）
+    ArgumentCountMismatchRange {
+        min_expected: usize,
+        max_expected: usize,
+        actual: usize,
+    },
     /// 类型参数数量不匹配
     TypeArgumentCountMismatch {
         expected: usize,
@@ -169,6 +175,14 @@ impl TypeError {
         )
     }
     
+    /// 创建参数数量不匹配错误（带默认参数范围）
+    pub fn argument_count_mismatch_range(min_expected: usize, max_expected: usize, actual: usize, span: Span) -> Self {
+        Self::new(
+            TypeErrorKind::ArgumentCountMismatchRange { min_expected, max_expected, actual },
+            span,
+        )
+    }
+    
     /// 创建不可调用错误
     pub fn not_callable(ty: Type, span: Span) -> Self {
         Self::new(TypeErrorKind::NotCallable(ty), span)
@@ -221,6 +235,9 @@ impl fmt::Display for TypeError {
             }
             TypeErrorKind::ArgumentCountMismatch { expected, actual } => {
                 write!(f, "参数数量不匹配: 期望 {}, 实际 {}", expected, actual)
+            }
+            TypeErrorKind::ArgumentCountMismatchRange { min_expected, max_expected, actual } => {
+                write!(f, "参数数量不匹配: 期望 {}-{}, 实际 {}", min_expected, max_expected, actual)
             }
             TypeErrorKind::TypeArgumentCountMismatch { expected, actual } => {
                 write!(f, "类型参数数量不匹配: 期望 {}, 实际 {}", expected, actual)

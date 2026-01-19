@@ -76,8 +76,8 @@ impl Unifier {
             
             // 函数类型
             (
-                Function { param_types: p1, return_type: r1 },
-                Function { param_types: p2, return_type: r2 },
+                Function { param_types: p1, return_type: r1, .. },
+                Function { param_types: p2, return_type: r2, .. },
             ) => {
                 if p1.len() != p2.len() {
                     return Err(TypeError::new(
@@ -245,7 +245,7 @@ impl Unifier {
         
         match ty {
             Type::TypeVar(v) => v.id == var.id,
-            Type::Function { param_types, return_type } => {
+            Type::Function { param_types, return_type, .. } => {
                 param_types.iter().any(|t| self.occurs_in(var, t)) ||
                 self.occurs_in(var, &return_type)
             }

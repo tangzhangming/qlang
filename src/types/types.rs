@@ -345,6 +345,8 @@ pub enum Type {
     Function {
         param_types: Vec<Type>,
         return_type: Box<Type>,
+        /// 必需参数数量（不包含默认参数）
+        required_params: usize,
     },
     /// 可空类型
     Nullable(Box<Type>),
@@ -488,10 +490,11 @@ impl Type {
             Type::Tuple(types) => {
                 Type::Tuple(types.iter().map(|t| t.substitute(subst)).collect())
             }
-            Type::Function { param_types, return_type } => {
+            Type::Function { param_types, return_type, required_params } => {
                 Type::Function {
                     param_types: param_types.iter().map(|t| t.substitute(subst)).collect(),
                     return_type: Box::new(return_type.substitute(subst)),
+                    required_params: *required_params,
                 }
             }
             Type::Nullable(inner) => {
@@ -553,7 +556,7 @@ impl Type {
                     t.collect_type_vars(vars);
                 }
             }
-            Type::Function { param_types, return_type } => {
+            Type::Function { param_types, return_type, .. } => {
                 for t in param_types {
                     t.collect_type_vars(vars);
                 }
@@ -599,7 +602,7 @@ impl Type {
                 key_type.has_type_params() || value_type.has_type_params()
             }
             Type::Tuple(types) => types.iter().any(|t| t.has_type_params()),
-            Type::Function { param_types, return_type } => {
+            Type::Function { param_types, return_type, .. } => {
                 param_types.iter().any(|t| t.has_type_params()) || return_type.has_type_params()
             }
             Type::Generic { base_type, type_args } => {
@@ -867,7 +870,7 @@ impl fmt::Display for Type {
                 }
                 write!(f, ")")
             }
-            Type::Function { param_types, return_type } => {
+            Type::Function { param_types, return_type, .. } => {
                 write!(f, "fn(")?;
                 for (i, t) in param_types.iter().enumerate() {
                     if i > 0 {

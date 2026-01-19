@@ -22,6 +22,8 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_UNKNOWN_FUNCTION => "未知的函数: '{}'",
         ERR_COMPILE_CONSTRUCTOR_OVERLOAD => "不允许构造函数重载：只能定义一个 'init' 方法",
         ERR_COMPILE_CONSTRUCTOR_RETURN => "构造函数 'init' 不能有返回类型",
+        ERR_COMPILE_CONSTRUCTOR_VISIBILITY => "构造函数 'init' 必须是 public（默认可见性）",
+        ERR_COMPILE_EXPECTED_VAR_OR_FUNC => "类中只能定义 'var'、'const' 字段或 'func' 方法",
         
         // 类型检查错误
         ERR_TYPE_UNDEFINED_TYPE => "未定义的类型: '{}'",
@@ -74,6 +76,13 @@ pub fn get(key: &str) -> &'static str {
         MSG_CLI_ERROR => "错误: {}",
         MSG_CLI_FILE_NOT_FOUND => "文件未找到: {}",
         MSG_CLI_INVALID_EXTENSION => "无效的文件扩展名: '{}'。请使用 '.{}' 文件",
+        MSG_CLI_CANNOT_READ_FILE => "无法读取文件 {}: {}",
+        MSG_CLI_PARSE_FAILED => "解析 {} 失败:\n{}",
+        MSG_CLI_SYNTAX_ERROR => "[语法错误]",
+        MSG_CLI_IMPORT_ERROR => "[导入错误]",
+        MSG_CLI_TYPE_ERROR => "[类型检查错误]",
+        MSG_CLI_COMPILE_ERROR => "[编译错误]",
+        MSG_CLI_RUNTIME_ERROR => "[运行时错误]",
         MSG_CLI_HELP => "Q 语言 - 一个现代化、生产级的编程语言",
         MSG_CLI_COMMANDS => "命令:\n  run <文件>     运行 Q 源文件\n  build <文件>   编译 Q 源文件\n  repl           启动交互式 REPL\n  help           显示此帮助信息",
         

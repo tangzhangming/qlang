@@ -970,10 +970,46 @@ impl Compiler {
                             self.errors.push(CompileError::new(msg, method.span));
                         }
                         
-                        // 定义其他参数
-                        for param in &method.params {
+                        // 定义其他参数并处理默认值
+                        let mut required_params = 1; // self is required
+                        let mut defaults = Vec::new();
+                        let mut has_default = false;
+                        let mut has_variadic = false;
+                        
+                        for (idx, param) in method.params.iter().enumerate() {
                             if let Err(msg) = self.symbols.define(param.name.clone(), param.type_ann.ty.clone(), false) {
                                 self.errors.push(CompileError::new(msg, param.span));
+                            }
+                            
+                            // 处理可变参数
+                            if param.variadic {
+                                has_variadic = true;
+                                if idx != method.params.len() - 1 {
+                                    self.errors.push(CompileError::new(
+                                        "Variadic parameter must be the last parameter".to_string(),
+                                        param.span,
+                                    ));
+                                }
+                                continue;
+                            }
+                            
+                            if let Some(default_expr) = &param.default {
+                                has_default = true;
+                                match self.expr_to_value(default_expr) {
+                                    Ok(value) => defaults.push(value),
+                                    Err(msg) => {
+                                        self.errors.push(CompileError::new(msg, param.span));
+                                        defaults.push(Value::null());
+                                    }
+                                }
+                            } else {
+                                if has_default {
+                                    self.errors.push(CompileError::new(
+                                        "Required parameter cannot follow optional parameter".to_string(),
+                                        param.span,
+                                    ));
+                                }
+                                required_params += 1;
                             }
                         }
                         
@@ -997,9 +1033,9 @@ impl Compiler {
                         let func = crate::vm::value::Function {
                             name: Some(format!("{}::{}", name, method.name)),
                             arity: method.params.len() + 1, // +1 for self
-                            required_params: method.params.len() + 1,
-                            defaults: Vec::new(),
-                            has_variadic: false,
+                            required_params,
+                            defaults,
+                            has_variadic,
                             chunk_index: func_start,
                             local_count,
                             upvalues: Vec::new(),

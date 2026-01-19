@@ -80,26 +80,32 @@ impl TypeChecker {
             "print" | "println" => Type::Function {
                 param_types: vec![Type::Dynamic],
                 return_type: Box::new(Type::Void),
+                required_params: 1,
             },
             "typeof" => Type::Function {
                 param_types: vec![Type::Dynamic],
                 return_type: Box::new(Type::String),
+                required_params: 1,
             },
             "typeinfo" => Type::Function {
                 param_types: vec![Type::Dynamic],
                 return_type: Box::new(Type::Dynamic), // 返回 RuntimeTypeInfo 对象
+                required_params: 1,
             },
             "sizeof" => Type::Function {
                 param_types: vec![Type::Dynamic],
                 return_type: Box::new(Type::Int),
+                required_params: 1,
             },
             "panic" => Type::Function {
                 param_types: vec![Type::String],
                 return_type: Box::new(Type::Never),
+                required_params: 1,
             },
             "time" => Type::Function {
                 param_types: vec![],
                 return_type: Box::new(Type::Int),
+                required_params: 0,
             },
             _ => Type::Unknown,
         }
@@ -348,16 +354,19 @@ impl TypeChecker {
                 }
             }
             Stmt::FnDef { name, type_params, params, return_type, .. } => {
+                // 计算必需参数数量（没有默认值的参数）
+                let required_params = params.iter().filter(|p| p.default.is_none() && !p.variadic).count();
                 let info = FunctionInfo {
                     name: name.clone(),
                     type_params: self.convert_type_params(type_params),
                     param_types: params.iter().map(|p| p.type_ann.ty.clone()).collect(),
                     param_names: params.iter().map(|p| p.name.clone()).collect(),
+                    required_params,
                     return_type: return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
                     is_method: false,
                     owner_type: None,
                 };
-                if let Err(e) = self.env.register_function(name.clone(), info) {
+                if let Err(_e) = self.env.register_function(name.clone(), info) {
                     self.errors.push(TypeError::new(
                         TypeErrorKind::DuplicateDefinition(name.clone()),
                         Span::default(),
@@ -695,6 +704,7 @@ impl TypeChecker {
                     Ok(Type::Function {
                         param_types: func.param_types.clone(),
                         return_type: Box::new(func.return_type.clone()),
+                        required_params: func.required_params,
                     })
                 } else if Self::is_builtin_function(name) {
                     // 内置函数返回特殊的函数类型
@@ -917,6 +927,7 @@ impl TypeChecker {
                 let param_types: Vec<Type> = params.iter()
                     .map(|p| p.type_ann.ty.clone())
                     .collect();
+                let required_params = param_types.len(); // 闭包参数都是必需的
                 
                 for param in params {
                     self.env.define_variable(param.name.clone(), param.type_ann.ty.clone(), false)
@@ -937,6 +948,7 @@ impl TypeChecker {
                 Ok(Type::Function {
                     param_types,
                     return_type: Box::new(ret_ty),
+                    required_params,
                 })
             }
             
@@ -974,9 +986,9 @@ impl TypeChecker {
             
             Expr::New { class_name, args, span } => {
                 // 先克隆 class 信息以避免借用冲突
-                let (is_abstract, init_param_types) = if let Some(TypeInfo::Class(info)) = self.env.lookup_type(class_name) {
-                    let init_types = info.methods.get("init").map(|m| m.param_types.clone());
-                    (info.is_abstract, init_types)
+                let (is_abstract, init_info) = if let Some(TypeInfo::Class(info)) = self.env.lookup_type(class_name) {
+                    let init_info = info.methods.get("init").cloned();
+                    (info.is_abstract, init_info)
                 } else {
                     return Err(TypeError::undefined_type(class_name.clone(), *span));
                 };
@@ -989,16 +1001,29 @@ impl TypeChecker {
                 }
                 
                 // 检查构造函数参数
-                if let Some(param_types) = init_param_types {
-                    if args.len() != param_types.len() {
+                if let Some(init) = init_info {
+                    let param_types = &init.param_types;
+                    let required = init.required_params;
+                    let total = param_types.len();
+                    
+                    // 检查参数数量：至少需要 required 个，最多 total 个
+                    if args.len() < required {
                         return Err(TypeError::argument_count_mismatch(
-                            param_types.len(),
+                            required,
+                            args.len(),
+                            *span,
+                        ));
+                    }
+                    if args.len() > total {
+                        return Err(TypeError::argument_count_mismatch(
+                            total,
                             args.len(),
                             *span,
                         ));
                     }
                     
-                    for (arg, param_ty) in args.iter().zip(&param_types) {
+                    // 类型检查提供的参数
+                    for (arg, param_ty) in args.iter().zip(param_types) {
                         let arg_ty = self.infer_expr(arg)?;
                         if !arg_ty.is_assignable_to(param_ty) {
                             return Err(TypeError::type_mismatch(
@@ -1164,15 +1189,28 @@ impl TypeChecker {
     /// 推导函数调用结果类型
     fn infer_call(&mut self, callee: &Type, args: &[&Expr], span: Span) -> Result<Type, TypeError> {
         match callee {
-            Type::Function { param_types, return_type } => {
-                if args.len() != param_types.len() {
-                    return Err(TypeError::argument_count_mismatch(
-                        param_types.len(),
-                        args.len(),
-                        span,
-                    ));
+            Type::Function { param_types, return_type, required_params } => {
+                // 检查参数数量：最少 required_params 个，最多 param_types.len() 个
+                if args.len() < *required_params || args.len() > param_types.len() {
+                    if *required_params == param_types.len() {
+                        // 没有默认参数，使用普通错误消息
+                        return Err(TypeError::argument_count_mismatch(
+                            param_types.len(),
+                            args.len(),
+                            span,
+                        ));
+                    } else {
+                        // 有默认参数，使用范围错误消息
+                        return Err(TypeError::argument_count_mismatch_range(
+                            *required_params,
+                            param_types.len(),
+                            args.len(),
+                            span,
+                        ));
+                    }
                 }
                 
+                // 只检查提供的参数类型
                 for (arg, param_ty) in args.iter().zip(param_types) {
                     let arg_ty = self.infer_expr(arg)?;
                     if !arg_ty.is_assignable_to(param_ty) {
@@ -1226,6 +1264,7 @@ impl TypeChecker {
             return Ok(Type::Function {
                 param_types: method.param_types.clone(),
                 return_type: Box::new(method.return_type.clone()),
+                required_params: method.required_params,
             });
         }
         
@@ -1244,10 +1283,12 @@ impl TypeChecker {
                     "charAt" => Ok(Type::Function {
                         param_types: vec![Type::Int],
                         return_type: Box::new(Type::Char),
+                        required_params: 1,
                     }),
                     "substring" => Ok(Type::Function {
                         param_types: vec![Type::Int, Type::Int],
                         return_type: Box::new(Type::String),
+                        required_params: 2,
                     }),
                     _ => Err(TypeError::new(
                         TypeErrorKind::UndefinedMethod {
@@ -1265,10 +1306,12 @@ impl TypeChecker {
                     "push" | "append" => Ok(Type::Function {
                         param_types: vec![element_type.as_ref().clone()],
                         return_type: Box::new(Type::Void),
+                        required_params: 1,
                     }),
                     "pop" => Ok(Type::Function {
                         param_types: vec![],
                         return_type: Box::new(Type::Nullable(element_type.clone())),
+                        required_params: 0,
                     }),
                     _ => Err(TypeError::new(
                         TypeErrorKind::UndefinedMethod {
@@ -1378,6 +1421,7 @@ impl TypeChecker {
             type_params: Vec::new(),
             param_types: m.params.iter().map(|p| p.type_ann.ty.clone()).collect(),
             param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+            required_params: m.params.iter().filter(|p| p.default.is_none() && !p.variadic).count(),
             return_type: m.return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
             is_method: true,
             owner_type: None,
@@ -1429,6 +1473,7 @@ impl TypeChecker {
                 type_params: Vec::new(),
                 param_types: m.params.iter().map(|p| p.type_ann.ty.clone()).collect(),
                 param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+                required_params: m.params.iter().filter(|p| p.default.is_none() && !p.variadic).count(),
                 return_type: m.return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
                 is_method: true,
                 owner_type: None,
@@ -1445,6 +1490,7 @@ impl TypeChecker {
                 type_params: Vec::new(),
                 param_types: m.params.iter().map(|p| p.type_ann.ty.clone()).collect(),
                 param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+                required_params: m.params.iter().filter(|p| p.default.is_none() && !p.variadic).count(),
                 return_type: m.return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
                 is_method: false,
                 owner_type: None,
@@ -1459,6 +1505,7 @@ impl TypeChecker {
             type_params: Vec::new(),
             param_types: m.params.iter().map(|p| p.type_ann.ty.clone()).collect(),
             param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+            required_params: m.params.iter().filter(|p| p.default.is_none() && !p.variadic).count(),
             return_type: m.return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
             is_method: true,
             owner_type: None,
@@ -1472,6 +1519,7 @@ impl TypeChecker {
             type_params: Vec::new(),
             param_types: m.params.iter().map(|p| p.type_ann.ty.clone()).collect(),
             param_names: m.params.iter().map(|p| p.name.clone()).collect(),
+            required_params: m.params.iter().filter(|p| p.default.is_none() && !p.variadic).count(),
             return_type: m.return_type.as_ref().map(|t| t.ty.clone()).unwrap_or(Type::Void),
             is_method: true,
             owner_type: None,

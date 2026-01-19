@@ -2212,6 +2212,7 @@ impl VM {
                                         is_method_call: true,
                                     };
                                     self.frames.push(frame);
+                                    self.current_base = this_slot;
                                     self.ip = func.chunk_index;
                                     continue;
                                 }
@@ -2259,6 +2260,7 @@ impl VM {
                                         is_method_call: true,
                                     };
                                     self.frames.push(frame);
+                                    self.current_base = this_slot;
                                     self.ip = func.chunk_index;
                                     continue;
                                 }
@@ -2336,6 +2338,7 @@ impl VM {
                                         is_method_call: true,
                                     };
                                     self.frames.push(frame);
+                                    self.current_base = this_slot;
                                     self.ip = func.chunk_index;
                                     continue;
                                 }
@@ -2383,6 +2386,7 @@ impl VM {
                                         is_method_call: true,
                                     };
                                     self.frames.push(frame);
+                                    self.current_base = this_slot;
                                     self.ip = func.chunk_index;
                                     continue;
                                 }
@@ -3480,6 +3484,7 @@ impl VM {
                         is_method_call: true, // 实例方法调用
                     };
                     self.frames.push(frame);
+                    self.current_base = receiver_idx; // 设置当前栈基址
                     
                     // 跳转到方法体
                     self.ip = func.chunk_index;
@@ -3863,6 +3868,7 @@ impl VM {
                         is_method_call: true, // 没有函数值在栈上，类似方法调用
                     };
                     self.frames.push(frame);
+                    self.current_base = base;
                     self.ip = func.chunk_index;
                 }
                 
@@ -3917,6 +3923,7 @@ impl VM {
                         is_method_call: true, // super 方法调用
                     };
                     self.frames.push(frame);
+                    self.current_base = receiver_idx;
                     self.ip = func.chunk_index;
                 }
                 

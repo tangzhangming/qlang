@@ -22,6 +22,8 @@ pub fn get(key: &str) -> &'static str {
         ERR_COMPILE_UNKNOWN_FUNCTION => "Unknown function: '{}'",
         ERR_COMPILE_CONSTRUCTOR_OVERLOAD => "Constructor overloading is not allowed. Only one 'init' method is permitted",
         ERR_COMPILE_CONSTRUCTOR_RETURN => "Constructor 'init' cannot have a return type",
+        ERR_COMPILE_CONSTRUCTOR_VISIBILITY => "Constructor 'init' must be public (default visibility)",
+        ERR_COMPILE_EXPECTED_VAR_OR_FUNC => "Expected 'var', 'const', or 'func' in class body",
         
         // Type check errors
         ERR_TYPE_UNDEFINED_TYPE => "Undefined type: '{}'",
@@ -74,6 +76,13 @@ pub fn get(key: &str) -> &'static str {
         MSG_CLI_ERROR => "Error: {}",
         MSG_CLI_FILE_NOT_FOUND => "File not found: {}",
         MSG_CLI_INVALID_EXTENSION => "Invalid file extension: '{}'. Expected '.{}' file",
+        MSG_CLI_CANNOT_READ_FILE => "Cannot read file {}: {}",
+        MSG_CLI_PARSE_FAILED => "Failed to parse {}:\n{}",
+        MSG_CLI_SYNTAX_ERROR => "[Syntax Error]",
+        MSG_CLI_IMPORT_ERROR => "[Import Error]",
+        MSG_CLI_TYPE_ERROR => "[Type Error]",
+        MSG_CLI_COMPILE_ERROR => "[Compile Error]",
+        MSG_CLI_RUNTIME_ERROR => "[Runtime Error]",
         MSG_CLI_HELP => "Q Language - A modern, production-ready programming language",
         MSG_CLI_COMMANDS => "Commands:\n  run <file>     Run a Q source file\n  build <file>   Compile a Q source file\n  repl           Start interactive REPL\n  help           Show this help message",
         
