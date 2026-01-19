@@ -485,6 +485,7 @@ impl Scanner {
         match lexeme {
             // 声明关键字
             "var" => TokenKind::Var,
+            "val" => TokenKind::Val,
             "const" => TokenKind::Const,
             "func" => TokenKind::Func,
             "struct" => TokenKind::Struct,

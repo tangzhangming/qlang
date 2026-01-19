@@ -135,6 +135,14 @@ pub struct FnParam {
     pub default: Option<Expr>,
     /// 是否是可变参数（如 numbers:int...）
     pub variadic: bool,
+    /// 是否自动提升为类字段（构造函数参数属性提升）
+    /// 仅在 init 方法参数前有 var/val/const 时为 true
+    pub is_field: bool,
+    /// 字段是否可变（var=true, val/const=false）
+    /// 仅当 is_field=true 时有意义
+    pub is_mutable: bool,
+    /// 字段可见性（仅当 is_field=true 时有意义）
+    pub field_visibility: Option<Visibility>,
     /// 位置信息
     pub span: Span,
 }

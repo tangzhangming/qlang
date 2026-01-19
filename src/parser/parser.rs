@@ -871,9 +871,9 @@ impl Parser {
         // 方法名
         let name = self.expect_identifier()?;
         
-        // 参数列表
+        // 参数列表（struct 方法不允许字段修饰符）
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选）
@@ -1009,6 +1009,13 @@ impl Parser {
         // 期望 '}'
         self.expect(&TokenKind::RightBrace)?;
         
+        // 检查是否有多个构造函数（禁止构造函数重载）
+        let init_methods: Vec<_> = methods.iter().filter(|m| m.name == "init").collect();
+        if init_methods.len() > 1 {
+            let msg = "Constructor overloading is not allowed. Only one 'init' method is permitted".to_string();
+            return Err(ParseError::new(msg, init_methods[1].span));
+        }
+        
         let end_span = self.previous_span();
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
@@ -1075,9 +1082,10 @@ impl Parser {
             return Err(ParseError::new(msg, self.current_span()));
         }
         
-        // 参数列表
+        // 参数列表（init 方法允许字段修饰符 var/val/const）
+        let is_init = name == "init";
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(is_init)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选，init 构造函数没有返回类型）
@@ -1152,9 +1160,9 @@ impl Parser {
         // 方法名
         let name = self.expect_identifier()?;
         
-        // 参数列表
+        // 参数列表（interface 方法不允许字段修饰符）
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选）
@@ -1230,9 +1238,9 @@ impl Parser {
         // 方法名
         let name = self.expect_identifier()?;
         
-        // 参数列表
+        // 参数列表（trait 方法不允许字段修饰符）
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选）
@@ -2484,9 +2492,9 @@ impl Parser {
         // 解析可选的泛型类型参数 <T, U>
         let type_params = self.parse_type_params()?;
         
-        // 参数列表
+        // 参数列表（包级函数不允许字段修饰符）
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 返回类型（可选）
@@ -2507,9 +2515,9 @@ impl Parser {
     
     /// 解析闭包表达式
     fn parse_closure(&mut self, start_span: Span) -> Result<Expr, ParseError> {
-        // 解析参数列表
+        // 解析参数列表（闭包不允许字段修饰符）
         self.expect(&TokenKind::LeftParen)?;
-        let params = self.parse_fn_params()?;
+        let params = self.parse_fn_params(false)?;
         self.expect(&TokenKind::RightParen)?;
         
         // 解析可选的返回类型
@@ -2532,7 +2540,8 @@ impl Parser {
     }
     
     /// 解析函数参数列表
-    fn parse_fn_params(&mut self) -> Result<Vec<FnParam>, ParseError> {
+    /// allow_field_modifiers: 是否允许 var/val/const 修饰符（仅在 init 方法中允许）
+    fn parse_fn_params(&mut self, allow_field_modifiers: bool) -> Result<Vec<FnParam>, ParseError> {
         let mut params = Vec::new();
         
         if self.check(&TokenKind::RightParen) {
@@ -2541,6 +2550,34 @@ impl Parser {
         
         loop {
             let start_span = self.current_span();
+            
+            // 检查是否有字段修饰符（可选的可见性 + var/val/const）
+            let mut is_field = false;
+            let mut is_mutable = false;
+            let mut field_visibility: Option<super::ast::Visibility> = None;
+            
+            if allow_field_modifiers {
+                // 可选的可见性修饰符
+                if self.check(&TokenKind::Public) || self.check(&TokenKind::Private) 
+                    || self.check(&TokenKind::Protected) || self.check(&TokenKind::Internal) {
+                    field_visibility = Some(self.parse_visibility());
+                }
+                
+                // 检查 var/val/const
+                if self.check(&TokenKind::Var) {
+                    self.advance();
+                    is_field = true;
+                    is_mutable = true;
+                } else if self.check(&TokenKind::Val) || self.check(&TokenKind::Const) {
+                    self.advance();
+                    is_field = true;
+                    is_mutable = false;
+                } else if field_visibility.is_some() {
+                    // 有可见性但没有 var/val/const 是错误的
+                    let msg = "Visibility modifier must be followed by 'var', 'val', or 'const'".to_string();
+                    return Err(ParseError::new(msg, self.current_span()));
+                }
+            }
             
             // 参数名
             let name = self.expect_identifier()?;
@@ -2572,6 +2609,9 @@ impl Parser {
                 type_ann,
                 default,
                 variadic,
+                is_field,
+                is_mutable,
+                field_visibility,
                 span: Span::new(start_span.start, end_span.end, start_span.line, start_span.column),
             });
             

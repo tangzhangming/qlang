@@ -28,6 +28,8 @@ pub enum TokenKind {
     // ============ 声明关键字 ============
     /// var
     Var,
+    /// val (immutable variable/field)
+    Val,
     /// const
     Const,
     /// func
@@ -382,6 +384,7 @@ impl fmt::Display for TokenKind {
             
             // 声明关键字
             TokenKind::Var => write!(f, "var"),
+            TokenKind::Val => write!(f, "val"),
             TokenKind::Const => write!(f, "const"),
             TokenKind::Func => write!(f, "func"),
             TokenKind::Struct => write!(f, "struct"),

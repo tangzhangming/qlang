@@ -849,6 +849,19 @@ impl Compiler {
                     }
                 }
                 
+                // 注册构造函数参数属性提升的字段
+                // 查找 init 方法，并注册 is_field=true 的参数为字段
+                for method in methods {
+                    if method.name == "init" {
+                        for param in &method.params {
+                            if param.is_field {
+                                self.chunk.register_field(name, param.name.clone());
+                            }
+                        }
+                        break; // 只有一个 init 方法
+                    }
+                }
+                
                 // 编译每个方法
                 for method in methods {
                     self.compile_class_method(name, method, parent.as_deref(), *span);
@@ -1411,6 +1424,26 @@ impl Compiler {
                     ));
                 }
                 required_params += 1;
+            }
+        }
+        
+        // 5.5 对于 init 方法，生成构造函数参数属性提升的字段赋值
+        if name == "init" && !*is_static {
+            for (param_idx, param) in params.iter().enumerate() {
+                if param.is_field {
+                    // 生成 this.field = param 的字节码
+                    // 1. 加载 this（槽 0）
+                    self.chunk.write_get_local(0, method_span.line);
+                    // 2. 加载参数值（槽 1 + param_idx，因为 this 在槽 0）
+                    self.chunk.write_get_local(1 + param_idx, method_span.line);
+                    // 3. SetField
+                    let field_name_index = self.chunk.add_constant(Value::string(param.name.clone()));
+                    self.chunk.write_op(OpCode::SetField, method_span.line);
+                    self.chunk.write_u16(field_name_index, method_span.line);
+                    // SetField 会将栈顶的值弹出，保留对象在栈上
+                    // 我们需要弹出 this
+                    self.chunk.write_op(OpCode::Pop, method_span.line);
+                }
             }
         }
         
