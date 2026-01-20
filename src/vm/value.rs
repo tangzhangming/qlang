@@ -77,34 +77,38 @@ const INTERN_THRESHOLD: usize = 64;
 // ============================================================================
 
 /// Quiet NaN 掩码（IEEE 754: 指数全1 + 最高尾数位为1）
-const QNAN: u64 = 0x7FFC_0000_0000_0000;
+/// 使用 0x7FF0 而非 0x7FFC，使低 4 位清零，避免与 TAG 值冲突
+const QNAN: u64 = 0x7FF0_0000_0000_0000;
 
 /// 符号位
 const SIGN_BIT: u64 = 0x8000_0000_0000_0000;
 
-/// 类型标签掩码
+/// 类型标签掩码（位 48-51）
 const TAG_MASK: u64 = 0x000F_0000_0000_0000;
 
-/// Null 值
+/// Null 值 (TAG = 0x1)
 const VAL_NULL: u64 = QNAN | 0x0001_0000_0000_0000;
 
-/// False 值
+/// False 值 (TAG = 0x2)
 const VAL_FALSE: u64 = QNAN | 0x0002_0000_0000_0000;
 
-/// True 值
+/// True 值 (TAG = 0x3)
 const VAL_TRUE: u64 = QNAN | 0x0003_0000_0000_0000;
 
-/// Int32 标签（低 32 位存储整数）
+/// Int32 标签（低 32 位存储整数）(TAG = 0x4)
 const TAG_INT32: u64 = QNAN | 0x0004_0000_0000_0000;
 
-/// Pointer 标签（低 48 位存储指针）
+/// Pointer 标签（低 48 位存储指针）(TAG = 0x5)
 const TAG_PTR: u64 = QNAN | 0x0005_0000_0000_0000;
 
-/// Int64 标签（指向堆上的 i64）
+/// Int64 标签（指向堆上的 i64）(TAG = 0x6)
 const TAG_INT64: u64 = QNAN | 0x0006_0000_0000_0000;
 
-/// Char 标签（低 32 位存储 char）
+/// Char 标签（低 32 位存储 char）(TAG = 0x7)
 const TAG_CHAR: u64 = QNAN | 0x0007_0000_0000_0000;
+
+/// Int128 标签（指向堆上的 i128）(TAG = 0x8)
+const TAG_INT128: u64 = QNAN | 0x0008_0000_0000_0000;
 
 /// 指针掩码（低 48 位）
 const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -132,12 +136,13 @@ pub enum HeapTag {
     Enum = 8,
     TypeRef = 9,
     Int64 = 10,
-    Channel = 11,
-    MutexValue = 12,
-    WaitGroup = 13,
-    Set = 14,
-    ArraySlice = 15,
-    RuntimeTypeInfo = 16,
+    Int128 = 11,
+    Channel = 12,
+    MutexValue = 13,
+    WaitGroup = 14,
+    Set = 15,
+    ArraySlice = 16,
+    RuntimeTypeInfo = 17,
 }
 
 /// 堆对象头部
@@ -158,6 +163,13 @@ pub struct HeapString {
 pub struct HeapInt64 {
     pub header: HeapObject,
     pub value: i64,
+}
+
+/// 堆上的 Int128
+#[repr(C)]
+pub struct HeapInt128 {
+    pub header: HeapObject,
+    pub value: i128,
 }
 
 /// 堆上的 Range
@@ -660,19 +672,28 @@ impl Value {
     
     /// 创建整数值
     #[inline(always)]
-    pub fn int(n: i64) -> Self {
+    pub fn int(n: i128) -> Self {
         // 如果在 i32 范围内，直接内联
-        if n >= INT32_MIN && n <= INT32_MAX {
+        if n >= INT32_MIN as i128 && n <= INT32_MAX as i128 {
             Value(TAG_INT32 | (n as u32 as u64))
-        } else {
-            // 否则装箱
+        } else if n >= i64::MIN as i128 && n <= i64::MAX as i128 {
+            // i64 范围内，装箱为 HeapInt64
             let boxed = Box::new(HeapInt64 {
                 header: HeapObject { tag: HeapTag::Int64 },
-                value: n,
+                value: n as i64,
             });
             let ptr = Box::into_raw(boxed) as u64;
             gc_register_object(ptr, HeapTag::Int64, std::mem::size_of::<HeapInt64>());
             Value(TAG_INT64 | (ptr & PTR_MASK))
+        } else {
+            // 超出 i64 范围，装箱为 HeapInt128
+            let boxed = Box::new(HeapInt128 {
+                header: HeapObject { tag: HeapTag::Int128 },
+                value: n,
+            });
+            let ptr = Box::into_raw(boxed) as u64;
+            gc_register_object(ptr, HeapTag::Int128, std::mem::size_of::<HeapInt128>());
+            Value(TAG_INT128 | (ptr & PTR_MASK))
         }
     }
     
@@ -951,7 +972,9 @@ impl Value {
     /// 是否是整数
     #[inline(always)]
     pub fn is_int(&self) -> bool {
-        (self.0 & (QNAN | TAG_MASK)) == TAG_INT32 || (self.0 & (QNAN | TAG_MASK)) == TAG_INT64
+        (self.0 & (QNAN | TAG_MASK)) == TAG_INT32 ||
+        (self.0 & (QNAN | TAG_MASK)) == TAG_INT64 ||
+        (self.0 & (QNAN | TAG_MASK)) == TAG_INT128
     }
     
     /// 是否是 Int32（内联整数）
@@ -1124,12 +1147,19 @@ impl Value {
     
     /// 获取整数值
     #[inline(always)]
-    pub fn as_int(&self) -> Option<i64> {
+    pub fn as_int(&self) -> Option<i128> {
         if (self.0 & (QNAN | TAG_MASK)) == TAG_INT32 {
             // 从低 32 位提取并符号扩展
-            Some((self.0 as u32) as i32 as i64)
+            Some((self.0 as u32) as i32 as i128)
         } else if (self.0 & (QNAN | TAG_MASK)) == TAG_INT64 {
             let ptr = (self.0 & PTR_MASK) as *const HeapInt64;
+            if !ptr.is_null() {
+                unsafe { Some((*ptr).value as i128) }
+            } else {
+                None
+            }
+        } else if (self.0 & (QNAN | TAG_MASK)) == TAG_INT128 {
+            let ptr = (self.0 & PTR_MASK) as *const HeapInt128;
             if !ptr.is_null() {
                 unsafe { Some((*ptr).value) }
             } else {
@@ -1166,7 +1196,8 @@ impl Value {
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         if let Some(i) = self.as_int() {
-            Some(i)
+            // 尝试将 i128 转换为 i64，如果超出范围则返回 None
+            i.try_into().ok()
         } else if let Some(f) = self.as_float() {
             Some(f as i64)
         } else if let Some(c) = self.as_char() {
@@ -1523,6 +1554,7 @@ impl Value {
             Some(HeapTag::Enum) => "enum",
             Some(HeapTag::TypeRef) => "type",
             Some(HeapTag::Int64) => "int",
+            Some(HeapTag::Int128) => "int",
             Some(HeapTag::Channel) => "channel",
             Some(HeapTag::MutexValue) => "mutex",
             Some(HeapTag::WaitGroup) => "waitgroup",

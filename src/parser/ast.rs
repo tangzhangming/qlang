@@ -163,9 +163,9 @@ pub struct FnParam {
 /// 表达式节点
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    /// 整数字面量
+    /// 整数字面量（使用 i128 以支持 u64 范围的值）
     Integer {
-        value: i64,
+        value: i128,
         span: Span,
     },
     /// 浮点数字面量

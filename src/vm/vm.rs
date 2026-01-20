@@ -474,7 +474,7 @@ impl VM {
             // 热路径：直接 u8 匹配，避免 OpCode::from() 开销
             match op {
                 OP_CONST_INT8 => {
-                    let value = self.read_byte() as i8 as i64;
+                    let value = self.read_byte() as i8 as i128;
                     self.push_fast(Value::int(value));
                     continue;
                 }
@@ -526,7 +526,7 @@ impl VM {
                 }
                 OP_GET_LOCAL_ADD_INT => {
                     let slot = self.read_u16() as usize;
-                    let add_value = self.read_byte() as i8 as i64;
+                    let add_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -535,7 +535,7 @@ impl VM {
                 }
                 OP_GET_LOCAL_SUB_INT => {
                     let slot = self.read_u16() as usize;
-                    let sub_value = self.read_byte() as i8 as i64;
+                    let sub_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -544,7 +544,7 @@ impl VM {
                 }
                 OP_GET_LOCAL_LE_INT => {
                     let slot = self.read_u16() as usize;
-                    let cmp_value = self.read_byte() as i8 as i64;
+                    let cmp_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let local = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { local.as_int().unwrap_unchecked() };
@@ -748,7 +748,7 @@ impl VM {
                 OP_JUMP_IF_LOCAL_LE_CONST => {
                     // 局部变量 <= 常量 ? 跳转
                     let slot = self.read_byte() as usize;
-                    let const_val = self.read_byte() as i8 as i64;
+                    let const_val = self.read_byte() as i8 as i128;
                     let offset = self.read_i16();
                     let actual = self.current_base + slot;
                     let local = unsafe { self.stack.get_unchecked(actual) };
@@ -761,7 +761,7 @@ impl VM {
                 OP_JUMP_IF_LOCAL_LT_CONST => {
                     // 局部变量 < 常量 ? 跳转
                     let slot = self.read_byte() as usize;
-                    let const_val = self.read_byte() as i8 as i64;
+                    let const_val = self.read_byte() as i8 as i128;
                     let offset = self.read_i16();
                     let actual = self.current_base + slot;
                     let local = unsafe { self.stack.get_unchecked(actual) };
@@ -796,14 +796,14 @@ impl VM {
                 }
                 OP_RETURN_INT => {
                     // 返回小整数常量
-                    let value = self.read_byte() as i8 as i64;
+                    let value = self.read_byte() as i8 as i128;
                     let return_value = Value::int(value);
-                    
+
                     if self.frames.is_empty() {
                         self.push_fast(return_value);
                         return Ok(());
                     }
-                    
+
                     let frame = unsafe { self.frames.pop().unwrap_unchecked() };
                     let truncate_to = if frame.is_method_call {
                         frame.base_slot as usize
@@ -1283,23 +1283,23 @@ impl VM {
                     } else if value.is_char() {
                         4
                     } else if let Some(s) = value.as_string() {
-                        s.len() as i64
+                        s.len() as i128
                     } else if value.is_function() {
                         0 // 函数大小不适用
                     } else if let Some(arr) = value.as_array() {
-                        arr.lock().len() as i64
+                        arr.lock().len() as i128
                     } else if let Some(m) = value.as_map() {
-                        m.lock().len() as i64
+                        m.lock().len() as i128
                     } else if value.is_range() {
                         24 // 两个i64 + bool
                     } else if value.is_iterator() {
                         0 // 迭代器大小不适用
                     } else if let Some(s) = value.as_struct() {
-                        s.lock().fields.len() as i64 // 字段数量
+                        s.lock().fields.len() as i128 // 字段数量
                     } else if let Some(c) = value.as_class() {
-                        c.lock().fields.len() as i64 // 字段数量
+                        c.lock().fields.len() as i128 // 字段数量
                     } else if let Some(e) = value.as_enum() {
-                        e.associated_data.len() as i64 // 关联数据字段数量
+                        e.associated_data.len() as i128 // 关联数据字段数量
                     } else {
                         0 // 类型引用本身没有大小
                     };
@@ -1312,7 +1312,7 @@ impl VM {
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
+                        .map(|d| d.as_millis() as i128)
                         .unwrap_or(0);
                     self.push(Value::int(timestamp));
                 }
@@ -1514,7 +1514,7 @@ impl VM {
                     let set_val = self.pop()?;
                     if let Some(set) = set_val.as_set() {
                         let set = set.lock();
-                        self.push(Value::int(set.len() as i64));
+                        self.push(Value::int(set.len() as i128));
                     } else {
                         return Err(self.runtime_error(&format!(
                             "Cannot get size of non-set type: {}",
@@ -1564,7 +1564,7 @@ impl VM {
                     if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
                             let arr = arr.lock();
                         let idx = if i < 0 {
-                            (arr.len() as i64 + i) as usize
+                            (arr.len() as i128 + i) as usize
                             } else {
                             i as usize
                             };
@@ -1576,7 +1576,7 @@ impl VM {
                             self.push(arr[idx].clone());
                     } else if let (Some(s), Some(i)) = (object.as_string(), index.as_int()) {
                         let idx = if i < 0 {
-                            (s.len() as i64 + i) as usize
+                            (s.len() as i128 + i) as usize
                             } else {
                             i as usize
                             };
@@ -1609,7 +1609,7 @@ impl VM {
                     if let (Some(arr), Some(i)) = (object.as_array(), index.as_int()) {
                             let mut arr = arr.lock();
                         let idx = if i < 0 {
-                            (arr.len() as i64 + i) as usize
+                            (arr.len() as i128 + i) as usize
                             } else {
                             i as usize
                             };
@@ -1636,7 +1636,7 @@ impl VM {
                     let start = self.pop()?;
                     
                     if let (Some(s), Some(e)) = (start.as_int(), end.as_int()) {
-                        self.push(Value::range(s, e, false));
+                        self.push(Value::range(s as i64, e as i64, false));
                     } else {
                             return Err(self.runtime_error(&format!(
                                 "Range requires integer bounds, got {} and {}",
@@ -1650,7 +1650,7 @@ impl VM {
                     let start = self.pop()?;
                     
                     if let (Some(s), Some(e)) = (start.as_int(), end.as_int()) {
-                        self.push(Value::range(s, e, true));
+                        self.push(Value::range(s as i64, e as i64, true));
                     } else {
                             return Err(self.runtime_error(&format!(
                                 "Range requires integer bounds, got {} and {}",
@@ -1709,9 +1709,9 @@ impl VM {
                                 } else {
                                     current < end
                                 };
-                                
+
                                 if has_more {
-                                    (Value::int(current), true)
+                                    (Value::int(current as i128), true)
                                 } else {
                                     (Value::null(), false)
                                 }
@@ -2694,7 +2694,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
-                                let len = arr.lock().len() as i64;
+                                let len = arr.lock().len() as i128;
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
                                 continue;
@@ -2757,7 +2757,7 @@ impl VM {
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
                                 let idx = arr.lock().iter().position(|x| x == &value)
-                                    .map(|i| i as i64)
+                                    .map(|i| i as i128)
                                     .unwrap_or(-1);
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(idx));
@@ -2770,7 +2770,7 @@ impl VM {
                                 }
                                 let value = self.stack[receiver_idx + 1].clone();
                                 let idx = arr.lock().iter().rposition(|x| x == &value)
-                                    .map(|i| i as i64)
+                                    .map(|i| i as i128)
                                     .unwrap_or(-1);
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(idx));
@@ -2868,7 +2868,7 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut results = Vec::with_capacity(elements.len());
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let result = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    let result = self.call_closure(&func, &[elem, Value::int(i as i128)])?;
                                     results.push(result);
                                 }
                                 self.push(Value::array(Arc::new(Mutex::new(results))));
@@ -2887,7 +2887,7 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut results = Vec::new();
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let keep = self.call_closure(&func, &[elem.clone(), Value::int(i as i64)])?;
+                                    let keep = self.call_closure(&func, &[elem.clone(), Value::int(i as i128)])?;
                                     if keep.is_truthy() {
                                         results.push(elem);
                                     }
@@ -2908,7 +2908,7 @@ impl VM {
                                 let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    acc = self.call_closure(&func, &[acc, elem, Value::int(i as i64)])?;
+                                    acc = self.call_closure(&func, &[acc, elem, Value::int(i as i128)])?;
                                 }
                                 self.push(acc);
                                 continue;
@@ -2925,7 +2925,7 @@ impl VM {
                                 let elements = arr.lock().clone();
                                 self.stack.truncate(receiver_idx);
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    self.call_closure(&func, &[elem, Value::int(i as i128)])?;
                                 }
                                 self.push(Value::null());
                                 continue;
@@ -2943,7 +2943,7 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut found = Value::null();
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let matches = self.call_closure(&func, &[elem.clone(), Value::int(i as i64)])?;
+                                    let matches = self.call_closure(&func, &[elem.clone(), Value::int(i as i128)])?;
                                     if matches.is_truthy() {
                                         found = elem;
                                         break;
@@ -2965,13 +2965,13 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut found_idx: i64 = -1;
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let matches = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    let matches = self.call_closure(&func, &[elem, Value::int(i as i128)])?;
                                     if matches.is_truthy() {
                                         found_idx = i as i64;
                                         break;
                                     }
                                 }
-                                self.push(Value::int(found_idx));
+                                self.push(Value::int(found_idx as i128));
                                 continue;
                             }
                             "every" | "all" => {
@@ -2987,7 +2987,7 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut all_pass = true;
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i128)])?;
                                     if !passes.is_truthy() {
                                         all_pass = false;
                                         break;
@@ -3009,7 +3009,7 @@ impl VM {
                                 self.stack.truncate(receiver_idx);
                                 let mut any_pass = false;
                                 for (i, elem) in elements.into_iter().enumerate() {
-                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i64)])?;
+                                    let passes = self.call_closure(&func, &[elem, Value::int(i as i128)])?;
                                     if passes.is_truthy() {
                                         any_pass = true;
                                         break;
@@ -3079,7 +3079,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
-                                let len = s.chars().count() as i64;
+                                let len = s.chars().count() as i128;
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
                                 continue;
@@ -3264,7 +3264,7 @@ impl VM {
                                     return Err(self.runtime_error("indexOf() expects a string argument"));
                                 };
                                 let result = s.find(&substr)
-                                    .map(|i| Value::int(i as i64))
+                                    .map(|i| Value::int(i as i128))
                                     .unwrap_or(Value::int(-1));
                                 self.stack.truncate(receiver_idx);
                                 self.push(result);
@@ -3281,7 +3281,7 @@ impl VM {
                                     return Err(self.runtime_error("lastIndexOf() expects a string argument"));
                                 };
                                 let result = s.rfind(&substr)
-                                    .map(|i| Value::int(i as i64))
+                                    .map(|i| Value::int(i as i128))
                                     .unwrap_or(Value::int(-1));
                                 self.stack.truncate(receiver_idx);
                                 self.push(result);
@@ -3363,7 +3363,7 @@ impl VM {
                                 if arg_count != 0 {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
-                                let len = map.lock().len() as i64;
+                                let len = map.lock().len() as i128;
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
                                 continue;
@@ -3495,7 +3495,7 @@ impl VM {
                                     return Err(self.runtime_error("start() expects 0 arguments"));
                                 }
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::int(start));
+                                self.push(Value::int(start as i128));
                                 continue;
                             }
                             "end" => {
@@ -3504,7 +3504,7 @@ impl VM {
                                     return Err(self.runtime_error("end() expects 0 arguments"));
                                 }
                                 self.stack.truncate(receiver_idx);
-                                self.push(Value::int(end));
+                                self.push(Value::int(end as i128));
                                 continue;
                             }
                             "len" => {
@@ -3513,9 +3513,9 @@ impl VM {
                                     return Err(self.runtime_error("len() expects 0 arguments"));
                                 }
                                 let len = if inclusive {
-                                    (end - start + 1).max(0)
+                                    (end - start + 1).max(0) as i128
                                 } else {
-                                    (end - start).max(0)
+                                    (end - start).max(0) as i128
                                 };
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::int(len));
@@ -3532,9 +3532,9 @@ impl VM {
                                     return Err(self.runtime_error("contains() expects an integer argument"));
                                 };
                                 let result = if inclusive {
-                                    value >= start && value <= end
+                                    value >= start as i128 && value <= end as i128
                                 } else {
-                                    value >= start && value < end
+                                    value >= start as i128 && value < end as i128
                                 };
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::bool(result));
@@ -3546,9 +3546,9 @@ impl VM {
                                     return Err(self.runtime_error("toArray() expects 0 arguments"));
                                 }
                                 let arr: Vec<Value> = if inclusive {
-                                    (start..=end).map(Value::int).collect()
+                                    (start..=end).map(|i| Value::int(i as i128)).collect()
                                 } else {
-                                    (start..end).map(Value::int).collect()
+                                    (start..end).map(|i| Value::int(i as i128)).collect()
                                 };
                                 self.stack.truncate(receiver_idx);
                                 self.push(Value::array(Arc::new(Mutex::new(arr))));
@@ -3591,8 +3591,8 @@ impl VM {
                                     return Err(self.runtime_error("step() argument must be positive"));
                                 }
                                 let mut arr = Vec::new();
-                                let mut i = start;
-                                let limit = if inclusive { end + 1 } else { end };
+                                let mut i = start as i128;
+                                let limit: i128 = if inclusive { end as i128 + 1 } else { end as i128 };
                                 while i < limit {
                                     arr.push(Value::int(i));
                                     i += step_val;
@@ -3921,7 +3921,7 @@ impl VM {
                                                 self.push(value);
                                             }
                                             OpCode::ConstInt8 => {
-                                                let value = self.read_byte() as i8 as i64;
+                                                let value = self.read_byte() as i8 as i128;
                                                 self.push(Value::int(value));
                                             }
                                             _ => {
@@ -4719,8 +4719,8 @@ impl VM {
                             }
                         }
                         
-                        self.push(Value::int(result_type));
-                        self.push(Value::int(result_idx));
+                        self.push(Value::int(result_type as i128));
+                        self.push(Value::int(result_idx as i128));
                         self.push(result_value);
                     } else {
                         return Err(self.runtime_error("Invalid select builder"));
@@ -4808,8 +4808,8 @@ impl VM {
                             }
                         }
                         
-                        self.push(Value::int(result_type));
-                        self.push(Value::int(result_idx));
+                        self.push(Value::int(result_type as i128));
+                        self.push(Value::int(result_idx as i128));
                         self.push(result_value);
                     } else {
                         return Err(self.runtime_error("Invalid select builder"));
@@ -4905,7 +4905,7 @@ impl VM {
                 // ============ 融合指令 ============
                 OpCode::ConstInt8 => {
                     // 加载小整数常量
-                    let value = self.read_byte() as i8 as i64;
+                    let value = self.read_byte() as i8 as i128;
                     self.push_fast(Value::int(value));
                 }
                 
@@ -4920,7 +4920,7 @@ impl VM {
                 OpCode::GetLocalAddInt => {
                     // 获取局部变量并加整数
                     let slot = self.read_u16() as usize;
-                    let add_value = self.read_byte() as i8 as i64;
+                    let add_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -4930,7 +4930,7 @@ impl VM {
                 OpCode::GetLocalSubInt => {
                     // 获取局部变量并减整数
                     let slot = self.read_u16() as usize;
-                    let sub_value = self.read_byte() as i8 as i64;
+                    let sub_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -4987,7 +4987,7 @@ impl VM {
                 OpCode::GetLocalLeInt => {
                     // 获取局部变量并与整数比较小于等于
                     let slot = self.read_u16() as usize;
-                    let cmp_value = self.read_byte() as i8 as i64;
+                    let cmp_value = self.read_byte() as i8 as i128;
                     let actual_slot = self.current_base + slot;
                     let local = unsafe { self.stack.get_unchecked(actual_slot) };
                     let n = unsafe { local.as_int().unwrap_unchecked() };
@@ -5177,7 +5177,7 @@ impl VM {
                 
                 OpCode::JumpIfLocalLeConst => {
                     let slot = self.read_byte() as usize;
-                    let const_val = self.read_byte() as i8 as i64;
+                    let const_val = self.read_byte() as i8 as i128;
                     let offset = self.read_i16();
                     let actual = self.current_base + slot;
                     if let Some(n) = self.stack[actual].as_int() {
@@ -5189,7 +5189,7 @@ impl VM {
                 
                 OpCode::JumpIfLocalLtConst => {
                     let slot = self.read_byte() as usize;
-                    let const_val = self.read_byte() as i8 as i64;
+                    let const_val = self.read_byte() as i8 as i128;
                     let offset = self.read_i16();
                     let actual = self.current_base + slot;
                     if let Some(n) = self.stack[actual].as_int() {
@@ -5228,7 +5228,7 @@ impl VM {
                 }
                 
                 OpCode::ReturnInt => {
-                    let value = self.read_byte() as i8 as i64;
+                    let value = self.read_byte() as i8 as i128;
                     let return_value = Value::int(value);
                     
                     if self.frames.is_empty() {
@@ -5542,7 +5542,7 @@ impl VM {
         
         match opcode {
             OpCode::ConstInt8 => {
-                let value = self.read_byte() as i8 as i64;
+                let value = self.read_byte() as i8 as i128;
                 self.push_fast(Value::int(value));
             }
             OpCode::GetLocal | OpCode::GetLocalInt => {
@@ -5795,7 +5795,7 @@ impl VM {
             }
             OpCode::GetLocalAddInt => {
                 let slot = self.read_u16() as usize;
-                let add_value = self.read_byte() as i8 as i64;
+                let add_value = self.read_byte() as i8 as i128;
                 let actual_slot = self.current_base + slot;
                 let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                 let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -5803,7 +5803,7 @@ impl VM {
             }
             OpCode::GetLocalSubInt => {
                 let slot = self.read_u16() as usize;
-                let sub_value = self.read_byte() as i8 as i64;
+                let sub_value = self.read_byte() as i8 as i128;
                 let actual_slot = self.current_base + slot;
                 let base_value = unsafe { self.stack.get_unchecked(actual_slot) };
                 let n = unsafe { base_value.as_int().unwrap_unchecked() };
@@ -5811,7 +5811,7 @@ impl VM {
             }
             OpCode::GetLocalLeInt => {
                 let slot = self.read_u16() as usize;
-                let cmp_value = self.read_byte() as i8 as i64;
+                let cmp_value = self.read_byte() as i8 as i128;
                 let actual_slot = self.current_base + slot;
                 let local = unsafe { self.stack.get_unchecked(actual_slot) };
                 let n = unsafe { local.as_int().unwrap_unchecked() };
@@ -5868,13 +5868,13 @@ impl VM {
                 if let Some(n) = value.as_int() {
                     Value::int(n)
                 } else if let Some(f) = value.as_float() {
-                    Value::int(f as i64)
+                    Value::int(f as i128)
                 } else if let Some(b) = value.as_bool() {
                     Value::int(if b { 1 } else { 0 })
                 } else if let Some(s) = value.as_string() {
-                    s.parse::<i64>().map(Value::int).unwrap_or(Value::null())
+                    s.parse::<i128>().map(Value::int).unwrap_or(Value::null())
                 } else if let Some(c) = value.as_char() {
-                    Value::int(c as i64)
+                    Value::int(c as i128)
                 } else {
                     Value::null()
                 }
@@ -6424,7 +6424,7 @@ impl VM {
                 }
             }
             OpCode::ConstInt8 => {
-                let value = self.read_byte() as i8 as i64;
+                let value = self.read_byte() as i8 as i128;
                 self.push_fast(Value::int(value));
             }
             OpCode::AddInt => {

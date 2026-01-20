@@ -62,7 +62,7 @@ pub fn create_tcp_socket_instance(ptr: u64) -> Value {
     use parking_lot::Mutex;
     
     let mut fields = HashMap::new();
-    fields.insert("__handle".to_string(), Value::int(ptr as i64));
+    fields.insert("__handle".to_string(), Value::int(ptr as i128));
     
     let instance = ClassInstance {
         class_name: CLASS_TCPSOCKET.to_string(),
@@ -80,7 +80,7 @@ pub fn create_tcp_listener_instance(ptr: u64) -> Value {
     use parking_lot::Mutex;
     
     let mut fields = HashMap::new();
-    fields.insert("__handle".to_string(), Value::int(ptr as i64));
+    fields.insert("__handle".to_string(), Value::int(ptr as i128));
     
     let instance = ClassInstance {
         class_name: CLASS_TCPLISTENER.to_string(),
@@ -162,7 +162,7 @@ pub fn tcp_socket_send(instance: &Value, args: &[Value]) -> Result<Value, String
     let n = stream.write(&bytes)
         .map_err(|e| format!("Write error: {}", e))?;
 
-    Ok(Value::int(n as i64))
+    Ok(Value::int(n as i128))
 }
 
 /// TCPSocket.receive(buffer: int[]) -> int
@@ -197,11 +197,11 @@ pub fn tcp_socket_receive(instance: &Value, args: &[Value]) -> Result<Value, Str
     let mut buffer_guard = buffer.lock();
     for (i, &byte) in buf[..n].iter().enumerate() {
         if i < buffer_guard.len() {
-            buffer_guard[i] = Value::int(byte as i64);
+            buffer_guard[i] = Value::int(byte as i128);
         }
     }
 
-    Ok(Value::int(n as i64))
+    Ok(Value::int(n as i128))
 }
 
 /// TCPSocket.close() -> null
@@ -430,12 +430,12 @@ fn extract_listener_ptr(value: &Value) -> Result<u64, String> {
 
 // 创建TCPSocket Value（向后兼容）
 fn create_tcp_socket_value(ptr: u64) -> Value {
-    Value::int(ptr as i64)
+    Value::int(ptr as i128)
 }
 
 // 创建TCPListener Value（向后兼容）
 fn create_tcp_listener_value(ptr: u64) -> Value {
-    Value::int(ptr as i64)
+    Value::int(ptr as i128)
 }
 
 // 1. socket_connect - 连接到服务器（向后兼容）
@@ -473,7 +473,7 @@ pub fn socket_send(args: &[Value]) -> Result<Value, String> {
     let n = stream.write(&bytes)
         .map_err(|e| format!("Write error: {}", e))?;
 
-    Ok(Value::int(n as i64))
+    Ok(Value::int(n as i128))
 }
 
 // 3. socket_receive - 接收数据（向后兼容）
@@ -506,10 +506,10 @@ pub fn socket_receive(args: &[Value]) -> Result<Value, String> {
     // 写入buffer
     let mut buffer_guard = buffer.lock();
     for (i, &byte) in buf[..n].iter().enumerate() {
-        buffer_guard[i] = Value::int(byte as i64);
+        buffer_guard[i] = Value::int(byte as i128);
     }
 
-    Ok(Value::int(n as i64))
+    Ok(Value::int(n as i128))
 }
 
 // 4. socket_close - 关闭socket（向后兼容）

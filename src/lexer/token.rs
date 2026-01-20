@@ -10,8 +10,8 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // ============ 字面量 ============
-    /// 整数字面量
-    Integer(i64),
+    /// 整数字面量（使用 i128 以支持 u64 范围的值）
+    Integer(i128),
     /// 浮点数字面量
     Float(f64),
     /// 字符串字面量（双引号，支持插值）

@@ -513,7 +513,7 @@ impl Scanner {
                 Err(_) => self.error_token(&format!("Invalid float: {}", lexeme)),
             }
         } else {
-            match lexeme.parse::<i64>() {
+            match lexeme.parse::<i128>() {
                 Ok(value) => self.make_token(TokenKind::Integer(value)),
                 Err(_) => self.error_token(&format!("Invalid integer: {}", lexeme)),
             }
@@ -549,7 +549,7 @@ impl Scanner {
             .filter(|&&c| c != '_')
             .collect();
         
-        match i64::from_str_radix(&hex_str, 16) {
+        match i128::from_str_radix(&hex_str, 16) {
             Ok(value) => self.make_token(TokenKind::Integer(value)),
             Err(_) => self.error_token(&format!("Invalid hexadecimal number: 0x{}", hex_str)),
         }
@@ -584,7 +584,7 @@ impl Scanner {
             .filter(|&&c| c != '_')
             .collect();
         
-        match i64::from_str_radix(&bin_str, 2) {
+        match i128::from_str_radix(&bin_str, 2) {
             Ok(value) => self.make_token(TokenKind::Integer(value)),
             Err(_) => self.error_token(&format!("Invalid binary number: 0b{}", bin_str)),
         }
@@ -619,7 +619,7 @@ impl Scanner {
             .filter(|&&c| c != '_')
             .collect();
         
-        match i64::from_str_radix(&oct_str, 8) {
+        match i128::from_str_radix(&oct_str, 8) {
             Ok(value) => self.make_token(TokenKind::Integer(value)),
             Err(_) => self.error_token(&format!("Invalid octal number: 0o{}", oct_str)),
         }

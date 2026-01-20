@@ -644,7 +644,7 @@ fn build_http_response(status: i32, headers: &HashMap<String, String>, body: &st
 /// 创建HttpClient类实例
 pub fn create_http_client_instance(ptr: u64) -> Value {
     let mut fields = HashMap::new();
-    fields.insert("__handle".to_string(), Value::int(ptr as i64));
+    fields.insert("__handle".to_string(), Value::int(ptr as i128));
     
     let instance = ClassInstance {
         class_name: CLASS_HTTP_CLIENT.to_string(),
@@ -658,7 +658,7 @@ pub fn create_http_client_instance(ptr: u64) -> Value {
 /// 创建HttpServer类实例
 pub fn create_http_server_instance(ptr: u64) -> Value {
     let mut fields = HashMap::new();
-    fields.insert("__handle".to_string(), Value::int(ptr as i64));
+    fields.insert("__handle".to_string(), Value::int(ptr as i128));
     
     let instance = ClassInstance {
         class_name: CLASS_HTTP_SERVER.to_string(),
@@ -699,7 +699,7 @@ pub fn create_http_request_instance(request: &HttpRequestData) -> Value {
 pub fn create_http_response_from_data(response: &HttpResponseData) -> Value {
     let mut fields = HashMap::new();
     
-    fields.insert("status".to_string(), Value::int(response.status as i64));
+    fields.insert("status".to_string(), Value::int(response.status as i128));
     fields.insert("body".to_string(), Value::string(response.body.clone()));
     
     // 响应头转为map
@@ -716,7 +716,7 @@ pub fn create_http_response_from_data(response: &HttpResponseData) -> Value {
 }
 
 /// 创建HttpResponse类实例（用于构造函数）
-pub fn create_http_response_instance(status: i64, body: String, headers: HashMap<String, String>) -> Value {
+pub fn create_http_response_instance(status: i128, body: String, headers: HashMap<String, String>) -> Value {
     let mut fields = HashMap::new();
     
     fields.insert("status".to_string(), Value::int(status));
@@ -780,7 +780,7 @@ fn extract_handle_ptr(instance: &Value, class_name: &str) -> Result<u64, String>
 /// init(timeout_ms?: int) -> HttpClient
 pub fn http_client_init(args: &[Value]) -> Result<Value, String> {
     let timeout_ms = if !args.is_empty() {
-        args[0].as_int().unwrap_or(DEFAULT_TIMEOUT_MS as i64) as u64
+        args[0].as_int().unwrap_or(DEFAULT_TIMEOUT_MS as i128) as u64
     } else {
         DEFAULT_TIMEOUT_MS
     };

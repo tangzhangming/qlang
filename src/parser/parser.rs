@@ -14,12 +14,16 @@ enum Precedence {
     None,
     Or,         // ||
     And,        // &&
+    BitOr,      // |
+    BitXor,     // ^
+    BitAnd,     // &
     Equality,   // == !=
     Comparison, // < > <= >=
+    Shift,      // << >>
     Term,       // + -
     Factor,     // * / %
     Power,      // **
-    Unary,      // ! -
+    Unary,      // ! - ~
     Call,       // () []
     Primary,
 }
@@ -1628,8 +1632,9 @@ impl Parser {
         let start_span = self.current_span();
         self.advance(); // 消费 'match'
         
-        // 解析被匹配的表达式
-        let expr = self.parse_expression()?;
+        // 解析被匹配的表达式（不能是 struct 字面量，所以只解析到 { 之前）
+        // 使用 parse_precedence 而不是 parse_expression 来避免 x { } 被解析为 struct 字面量
+        let expr = self.parse_match_subject()?;
         
         // 期望 '{'
         self.expect(&TokenKind::LeftBrace)?;
@@ -1669,6 +1674,64 @@ impl Parser {
         let span = Span::new(start_span.start, end_span.end, start_span.line, start_span.column);
         
         Ok(Stmt::Match { expr, arms, span })
+    }
+    
+    /// 解析 match 的主体表达式（不能是 struct 字面量）
+    /// 这是因为 `match x { ... }` 和 `x { ... }` (struct 字面量) 有歧义
+    fn parse_match_subject(&mut self) -> Result<Expr, ParseError> {
+        // 解析简单表达式，不包括 struct 字面量
+        // 使用 parse_prefix_no_struct_literal 来避免歧义
+        let mut left = self.parse_prefix_no_struct_literal()?;
+        
+        // 循环解析中缀表达式，但遇到 { 时停止
+        while self.current_precedence() > Precedence::None {
+            left = self.parse_infix(left)?;
+        }
+        
+        Ok(left)
+    }
+    
+    /// 解析前缀表达式（不允许 struct 字面量）
+    fn parse_prefix_no_struct_literal(&mut self) -> Result<Expr, ParseError> {
+        let token = self.advance();
+        
+        match &token.kind {
+            TokenKind::Integer(n) => Ok(Expr::Integer { value: *n, span: token.span }),
+            TokenKind::Float(f) => Ok(Expr::Float { value: *f, span: token.span }),
+            TokenKind::String(s) => self.parse_string_interpolation(s.clone(), token.span),
+            TokenKind::RawString(s) => Ok(Expr::String { value: s.clone(), span: token.span }),
+            TokenKind::True => Ok(Expr::Bool { value: true, span: token.span }),
+            TokenKind::False => Ok(Expr::Bool { value: false, span: token.span }),
+            TokenKind::Null => Ok(Expr::Null { span: token.span }),
+            TokenKind::Identifier(name) => {
+                let name = name.clone();
+                // 检查是否是函数调用
+                if self.check(&TokenKind::LeftParen) {
+                    self.parse_call(name.clone(), token.span)
+                } else {
+                    // 不检查 LeftBrace，直接返回标识符
+                    Ok(Expr::Identifier { name: name.clone(), span: token.span })
+                }
+            }
+            TokenKind::LeftParen => {
+                let expr = self.parse_expression()?;
+                self.expect(&TokenKind::RightParen)?;
+                let end_span = self.previous_span();
+                Ok(Expr::Grouping {
+                    expr: Box::new(expr),
+                    span: Span::new(token.span.start, end_span.end, token.span.line, token.span.column),
+                })
+            }
+            TokenKind::This => Ok(Expr::This { span: token.span }),
+            _ => {
+                let msg = format_message(
+                    messages::ERR_COMPILE_EXPECTED_EXPRESSION,
+                    self.locale,
+                    &[],
+                );
+                Err(ParseError::new(msg, token.span))
+            }
+        }
     }
     
     /// 解析 match 分支
@@ -1713,20 +1776,40 @@ impl Parser {
             return Ok(super::ast::MatchPattern::Wildcard);
         }
         
-        // 检查是否是多值模式（或模式）
+        // 解析第一个模式
         let first = self.parse_single_match_pattern()?;
         
-        // 检查是否有 | 连接更多模式
-        if self.check(&TokenKind::Pipe) {
-            let mut patterns = vec![first];
-            while self.check(&TokenKind::Pipe) {
-                self.advance();
-                patterns.push(self.parse_single_match_pattern()?);
+        // 检查是否有逗号连接更多模式（多值匹配）
+        // 注意：只有当逗号后面跟着一个可以作为模式的 token 时才收集
+        let mut patterns = vec![first];
+        while self.check(&TokenKind::Comma) {
+            // 查看逗号后面是什么
+            if let Some(next) = self.peek_token() {
+                // 如果下一个 token 是换行、=> 或 if，说明这个逗号是 arm 分隔符
+                let next_kind = &next.kind;
+                if matches!(next_kind, TokenKind::FatArrow | TokenKind::If | TokenKind::RightBrace | TokenKind::Newline) {
+                    break;
+                }
+                // 如果下一个 token 可能是模式的开始（数字、标识符、_），继续收集
+                if !matches!(next_kind, 
+                    TokenKind::Integer(_) | TokenKind::Float(_) | TokenKind::String(_) | 
+                    TokenKind::RawString(_) | TokenKind::True | TokenKind::False | 
+                    TokenKind::Null | TokenKind::Identifier(_) | TokenKind::Underscore
+                ) {
+                    break;
+                }
             }
-            return Ok(super::ast::MatchPattern::Or(patterns));
+            
+            self.advance(); // 消费逗号
+            patterns.push(self.parse_single_match_pattern()?);
         }
         
-        Ok(first)
+        // 如果只有一个模式，返回该模式；否则返回 Or 模式
+        if patterns.len() == 1 {
+            Ok(patterns.into_iter().next().unwrap())
+        } else {
+            Ok(super::ast::MatchPattern::Or(patterns))
+        }
     }
     
     /// 解析单个 match 模式（不包括 | 组合）
@@ -2456,6 +2539,13 @@ impl Parser {
             TokenKind::AmpAmp => (BinOp::And, Precedence::And),
             TokenKind::PipePipe => (BinOp::Or, Precedence::Or),
             
+            // 位运算符
+            TokenKind::Amp => (BinOp::BitAnd, Precedence::BitAnd),
+            TokenKind::Pipe => (BinOp::BitOr, Precedence::BitOr),
+            TokenKind::Caret => (BinOp::BitXor, Precedence::BitXor),
+            TokenKind::LessLess => (BinOp::Shl, Precedence::Shift),
+            TokenKind::GreaterGreater => (BinOp::Shr, Precedence::Shift),
+            
             // 范围表达式 1..10 或 1..=10
             TokenKind::DotDot => {
                 let right = self.parse_precedence(Precedence::Term)?;
@@ -2727,9 +2817,13 @@ impl Parser {
             // 左结合：下一个优先级
             match precedence {
                 Precedence::Or => Precedence::And,
-                Precedence::And => Precedence::Equality,
+                Precedence::And => Precedence::BitOr,
+                Precedence::BitOr => Precedence::BitXor,
+                Precedence::BitXor => Precedence::BitAnd,
+                Precedence::BitAnd => Precedence::Equality,
                 Precedence::Equality => Precedence::Comparison,
-                Precedence::Comparison => Precedence::Term,
+                Precedence::Comparison => Precedence::Shift,
+                Precedence::Shift => Precedence::Term,
                 Precedence::Term => Precedence::Factor,
                 Precedence::Factor => Precedence::Power,
                 Precedence::Power => Precedence::Unary,
@@ -3112,14 +3206,23 @@ impl Parser {
             TokenKind::QuestionQuestion => Precedence::Or,
             // 范围运算符
             TokenKind::DotDot | TokenKind::DotDotEqual => Precedence::Comparison,
+            // 逻辑运算符
             TokenKind::PipePipe => Precedence::Or,
             TokenKind::AmpAmp => Precedence::And,
+            // 位运算符
+            TokenKind::Pipe => Precedence::BitOr,
+            TokenKind::Caret => Precedence::BitXor,
+            TokenKind::Amp => Precedence::BitAnd,
+            // 比较运算符
             TokenKind::EqualEqual | TokenKind::BangEqual => Precedence::Equality,
             TokenKind::Less | TokenKind::LessEqual | TokenKind::Greater | TokenKind::GreaterEqual => {
                 Precedence::Comparison
             }
             // 类型转换和检查
             TokenKind::As | TokenKind::Is => Precedence::Comparison,
+            // 移位运算符
+            TokenKind::LessLess | TokenKind::GreaterGreater => Precedence::Shift,
+            // 算术运算符
             TokenKind::Plus | TokenKind::Minus => Precedence::Term,
             TokenKind::Star | TokenKind::Slash | TokenKind::Percent => Precedence::Factor,
             TokenKind::StarStar => Precedence::Power,

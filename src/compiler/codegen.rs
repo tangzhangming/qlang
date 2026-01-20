@@ -624,7 +624,7 @@ impl Compiler {
                         }
                     } else if let Expr::Integer { value: int_val, .. } = expr {
                         // 超级指令优化：返回小整数常量
-                        if *int_val >= i8::MIN as i64 && *int_val <= i8::MAX as i64 {
+                        if *int_val >= i8::MIN as i128 && *int_val <= i8::MAX as i128 {
                             self.chunk.write_return_int(*int_val as i8, span.line);
                         } else {
                             self.compile_expr(expr);
@@ -711,9 +711,119 @@ impl Compiler {
                             // 总是匹配
                             None
                         }
-                        MatchPattern::Or(_) => {
-                            let msg = "Or pattern not yet implemented".to_string();
-                            self.errors.push(CompileError::new(msg, *span));
+                        MatchPattern::Or(patterns) => {
+                            // Or 模式：任何一个子模式匹配就执行分支体
+                            // 实现策略：
+                            // 1. 对每个子模式生成匹配检查
+                            // 2. 如果匹配，跳转到分支体
+                            // 3. 如果不匹配，继续下一个子模式
+                            // 4. 所有子模式都不匹配时，跳到下一分支
+                            
+                            let mut success_jumps = Vec::new();
+                            let mut fail_jumps = Vec::new();
+                            
+                            for (i, sub_pattern) in patterns.iter().enumerate() {
+                                let is_last_sub = i == patterns.len() - 1;
+                                
+                                match sub_pattern {
+                                    MatchPattern::Literal(lit_expr) => {
+                                        // 获取 match_value
+                                        self.chunk.write_get_local(match_slot, span.line);
+                                        // 编译模式字面量
+                                        self.compile_expr(lit_expr);
+                                        // 比较
+                                        self.chunk.write_op(OpCode::Eq, span.line);
+                                        
+                                        if is_last_sub {
+                                            // 最后一个子模式：如果不匹配，跳到下一分支
+                                            let fail_jump = self.chunk.write_jump(OpCode::JumpIfFalse, span.line);
+                                            self.chunk.write_op(OpCode::Pop, span.line); // 弹出 true
+                                            fail_jumps.push(fail_jump);
+                                        } else {
+                                            // 非最后一个：如果匹配，跳到分支体
+                                            let success_jump = self.chunk.write_jump(OpCode::JumpIfTrue, span.line);
+                                            self.chunk.write_op(OpCode::Pop, span.line); // 弹出 false，继续下一模式
+                                            success_jumps.push(success_jump);
+                                        }
+                                    }
+                                    MatchPattern::Range { start, end, inclusive } => {
+                                        // 范围模式：match_value >= start && match_value <= end (或 < end)
+                                        // 获取 match_value 并与 start 比较
+                                        self.chunk.write_get_local(match_slot, span.line);
+                                        self.compile_expr(start);
+                                        self.chunk.write_op(OpCode::Ge, span.line);
+                                        
+                                        // 如果 match < start，跳过范围检查
+                                        let range_fail1 = self.chunk.write_jump(OpCode::JumpIfFalse, span.line);
+                                        self.chunk.write_op(OpCode::Pop, span.line); // 弹出 true
+                                        
+                                        // 检查上界
+                                        self.chunk.write_get_local(match_slot, span.line);
+                                        self.compile_expr(end);
+                                        if *inclusive {
+                                            self.chunk.write_op(OpCode::Le, span.line);
+                                        } else {
+                                            self.chunk.write_op(OpCode::Lt, span.line);
+                                        }
+                                        
+                                        if is_last_sub {
+                                            // 最后一个：如果不在范围内，跳到下一分支
+                                            let fail_jump = self.chunk.write_jump(OpCode::JumpIfFalse, span.line);
+                                            self.chunk.write_op(OpCode::Pop, span.line); // 弹出 true
+                                            fail_jumps.push(fail_jump);
+                                            
+                                            // 回填 range_fail1：不在范围内
+                                            self.chunk.patch_jump(range_fail1);
+                                            self.chunk.write_op(OpCode::Pop, span.line);
+                                            // 继续到下一分支（通过 fail_jump 跳转）
+                                        } else {
+                                            // 非最后一个：如果在范围内，跳到分支体
+                                            let success_jump = self.chunk.write_jump(OpCode::JumpIfTrue, span.line);
+                                            self.chunk.write_op(OpCode::Pop, span.line); // 弹出 false
+                                            success_jumps.push(success_jump);
+                                            
+                                            // 回填 range_fail1：不在范围内，继续下一子模式
+                                            self.chunk.patch_jump(range_fail1);
+                                            self.chunk.write_op(OpCode::Pop, span.line);
+                                        }
+                                    }
+                                    MatchPattern::Wildcard | MatchPattern::Variable(_) => {
+                                        // 通配符和变量总是匹配，无需跳转
+                                        // 如果出现在 Or 模式中，相当于整个 Or 必定匹配
+                                    }
+                                    MatchPattern::Or(nested) => {
+                                        // 嵌套的 Or - 递归展开（简单处理：报错）
+                                        let msg = "Nested Or patterns not supported".to_string();
+                                        self.errors.push(CompileError::new(msg, *span));
+                                    }
+                                    MatchPattern::Type { .. } => {
+                                        let msg = "Type pattern in Or not yet implemented".to_string();
+                                        self.errors.push(CompileError::new(msg, *span));
+                                    }
+                                }
+                            }
+                            
+                            // 回填成功跳转：跳到分支体之前，需要先弹出 true
+                            for jump in &success_jumps {
+                                self.chunk.patch_jump(*jump);
+                            }
+                            if !success_jumps.is_empty() {
+                                self.chunk.write_op(OpCode::Pop, span.line); // 弹出 true
+                            }
+                            
+                            // 执行分支体
+                            self.compile_stmt(&arm.body);
+                            
+                            // 跳转到 match 结束
+                            let end_jump = self.chunk.write_jump(OpCode::Jump, span.line);
+                            end_jumps.push(end_jump);
+                            
+                            // 回填失败跳转：所有子模式都不匹配
+                            for jump in fail_jumps {
+                                self.chunk.patch_jump(jump);
+                            }
+                            self.chunk.write_op(OpCode::Pop, span.line); // 弹出 false
+                            
                             continue;
                         }
                         MatchPattern::Range { start, end, inclusive } => {
@@ -1739,7 +1849,7 @@ impl Compiler {
                 if both_int {
                     let try_emit_local_const = |compiler: &mut Compiler,
                                                 local_name: &str,
-                                                const_value: i64| {
+                                                const_value: i128| {
                         if const_value < -128 || const_value > 127 {
                             return false;
                         }
@@ -2388,7 +2498,7 @@ impl Compiler {
                     self.compile_expr(end_expr);
                 } else {
                     // 如果没有结束值，使用i64::MAX（表示无限）
-                    self.chunk.write_constant(Value::int(i64::MAX), span.line);
+                    self.chunk.write_constant(Value::int(i64::MAX as i128), span.line);
                 }
                 // 创建范围
                 if *inclusive {

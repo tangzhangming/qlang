@@ -556,6 +556,9 @@ impl MarkSweepGc {
                 HeapTag::Int64 => {
                     let _ = Box::from_raw(obj.ptr as *mut super::value::HeapInt64);
                 }
+                HeapTag::Int128 => {
+                    let _ = Box::from_raw(obj.ptr as *mut super::value::HeapInt128);
+                }
                 HeapTag::Channel => {
                     let _ = Box::from_raw(obj.ptr as *mut super::value::HeapChannel);
                 }
