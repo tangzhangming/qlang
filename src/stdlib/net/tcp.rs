@@ -8,12 +8,14 @@ use std::collections::HashMap;
 
 // Socket包装（存储在堆上）
 pub struct TcpSocketHandle {
-    stream: Arc<Mutex<TcpStream>>,
+    stream: Arc<Mutex<Option<TcpStream>>>,
+    closed: Arc<Mutex<bool>>,
 }
 
 // Listener包装
 pub struct TcpListenerHandle {
-    listener: Arc<Mutex<TcpListener>>,
+    listener: Arc<Mutex<Option<TcpListener>>>,
+    closed: Arc<Mutex<bool>>,
 }
 
 // 标准库类名常量
@@ -121,10 +123,11 @@ pub fn tcp_socket_init(args: &[Value]) -> Result<Value, String> {
 
     // 创建handle并包装为类实例
     let handle = Box::new(TcpSocketHandle {
-        stream: Arc::new(Mutex::new(stream))
+        stream: Arc::new(Mutex::new(Some(stream))),
+        closed: Arc::new(Mutex::new(false)),
     });
     let ptr = Box::into_raw(handle) as u64;
-    
+
     Ok(create_tcp_socket_instance(ptr))
 }
 
@@ -140,7 +143,15 @@ pub fn tcp_socket_send(instance: &Value, args: &[Value]) -> Result<Value, String
         .ok_or_else(|| "Invalid data: expected array".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let mut stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let mut stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_mut()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     // 转换byte array为Vec<u8>
     let bytes: Vec<u8> = data.lock()
@@ -166,7 +177,15 @@ pub fn tcp_socket_receive(instance: &Value, args: &[Value]) -> Result<Value, Str
         .ok_or_else(|| "Invalid buffer: expected array".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let mut stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let mut stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_mut()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     let buffer_len = buffer.lock().len();
     let mut buf = vec![0u8; buffer_len];
@@ -189,10 +208,21 @@ pub fn tcp_socket_receive(instance: &Value, args: &[Value]) -> Result<Value, Str
 /// 关闭socket连接
 pub fn tcp_socket_close(instance: &Value, _args: &[Value]) -> Result<Value, String> {
     let socket_ptr = extract_socket_ptr_from_instance(instance)?;
+    let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
 
-    // 释放资源
-    let _handle = unsafe { Box::from_raw(socket_ptr as *mut TcpSocketHandle) };
-    // Box被drop时会自动关闭连接
+    let mut closed = handle.closed.lock();
+    if *closed {
+        // 已经关闭，直接返回（防止双重释放）
+        return Ok(Value::null());
+    }
+
+    // 标记为已关闭
+    *closed = true;
+
+    // 关闭stream
+    if let Some(stream) = handle.stream.lock().take() {
+        drop(stream);  // 显式关闭TCP连接
+    }
 
     Ok(Value::null())
 }
@@ -209,7 +239,15 @@ pub fn tcp_socket_set_read_timeout(instance: &Value, args: &[Value]) -> Result<V
         .ok_or_else(|| "Invalid timeout: expected integer".to_string())? as u64;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
@@ -229,7 +267,15 @@ pub fn tcp_socket_set_write_timeout(instance: &Value, args: &[Value]) -> Result<
         .ok_or_else(|| "Invalid timeout: expected integer".to_string())? as u64;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))
         .map_err(|e| format!("Failed to set write timeout: {}", e))?;
@@ -249,7 +295,15 @@ pub fn tcp_socket_set_no_delay(instance: &Value, args: &[Value]) -> Result<Value
         .ok_or_else(|| "Invalid boolean value: expected boolean".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_nodelay(enabled)
         .map_err(|e| format!("Failed to set nodelay: {}", e))?;
@@ -261,9 +315,16 @@ pub fn tcp_socket_set_no_delay(instance: &Value, args: &[Value]) -> Result<Value
 /// 优雅关闭socket（关闭写端）
 pub fn tcp_socket_shutdown(instance: &Value, _args: &[Value]) -> Result<Value, String> {
     let socket_ptr = extract_socket_ptr_from_instance(instance)?;
-
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.shutdown(Shutdown::Write)
         .map_err(|e| format!("Failed to shutdown: {}", e))?;
@@ -292,7 +353,8 @@ pub fn tcp_listener_init(args: &[Value]) -> Result<Value, String> {
         .map_err(|e| format!("Bind failed: {}", e))?;
 
     let handle = Box::new(TcpListenerHandle {
-        listener: Arc::new(Mutex::new(listener))
+        listener: Arc::new(Mutex::new(Some(listener))),
+        closed: Arc::new(Mutex::new(false)),
     });
     let ptr = Box::into_raw(handle) as u64;
 
@@ -305,12 +367,21 @@ pub fn tcp_listener_accept(instance: &Value, _args: &[Value]) -> Result<Value, S
     let listener_ptr = extract_listener_ptr_from_instance(instance)?;
     let handle = unsafe { &*(listener_ptr as *const TcpListenerHandle) };
 
-    let listener = handle.listener.lock();
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Listener is closed".to_string());
+    }
+
+    let listener_opt = handle.listener.lock();
+    let listener = listener_opt.as_ref()
+        .ok_or_else(|| "Listener is closed".to_string())?;
+
     let (stream, _) = listener.accept()
         .map_err(|e| format!("Accept failed: {}", e))?;
 
     let socket_handle = Box::new(TcpSocketHandle {
-        stream: Arc::new(Mutex::new(stream))
+        stream: Arc::new(Mutex::new(Some(stream))),
+        closed: Arc::new(Mutex::new(false)),
     });
     let ptr = Box::into_raw(socket_handle) as u64;
 
@@ -321,10 +392,21 @@ pub fn tcp_listener_accept(instance: &Value, _args: &[Value]) -> Result<Value, S
 /// 关闭listener
 pub fn tcp_listener_close(instance: &Value, _args: &[Value]) -> Result<Value, String> {
     let listener_ptr = extract_listener_ptr_from_instance(instance)?;
+    let handle = unsafe { &*(listener_ptr as *const TcpListenerHandle) };
 
-    // 释放资源
-    let _handle = unsafe { Box::from_raw(listener_ptr as *mut TcpListenerHandle) };
-    // Box被drop时会自动关闭listener
+    let mut closed = handle.closed.lock();
+    if *closed {
+        // 已经关闭，直接返回（防止双重释放）
+        return Ok(Value::null());
+    }
+
+    // 标记为已关闭
+    *closed = true;
+
+    // 关闭listener
+    if let Some(listener) = handle.listener.lock().take() {
+        drop(listener);  // 显式关闭TCP listener
+    }
 
     Ok(Value::null())
 }
@@ -372,7 +454,15 @@ pub fn socket_send(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "Invalid data: expected array".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let mut stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let mut stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_mut()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     // 转换byte array为Vec<u8>
     let bytes: Vec<u8> = data.lock()
@@ -397,7 +487,15 @@ pub fn socket_receive(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "Invalid buffer: expected array".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let mut stream = handle.stream.lock();
+
+    // 检查是否已关闭
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let mut stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_mut()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     let buffer_len = buffer.lock().len();
     let mut buf = vec![0u8; buffer_len];
@@ -421,10 +519,21 @@ pub fn socket_close(args: &[Value]) -> Result<Value, String> {
     }
 
     let socket_ptr = extract_socket_ptr(&args[0])?;
+    let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
 
-    // 释放资源
-    let _handle = unsafe { Box::from_raw(socket_ptr as *mut TcpSocketHandle) };
-    // Box被drop时会自动关闭连接
+    let mut closed = handle.closed.lock();
+    if *closed {
+        // 已经关闭，直接返回（防止双重释放）
+        return Ok(Value::null());
+    }
+
+    // 标记为已关闭
+    *closed = true;
+
+    // 关闭stream
+    if let Some(stream) = handle.stream.lock().take() {
+        drop(stream);  // 显式关闭TCP连接
+    }
 
     Ok(Value::null())
 }
@@ -440,7 +549,14 @@ pub fn socket_set_read_timeout(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "Invalid timeout: expected integer".to_string())? as u64;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)))
         .map_err(|e| format!("Failed to set read timeout: {}", e))?;
@@ -459,7 +575,14 @@ pub fn socket_set_write_timeout(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "Invalid timeout: expected integer".to_string())? as u64;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)))
         .map_err(|e| format!("Failed to set write timeout: {}", e))?;
@@ -478,7 +601,14 @@ pub fn socket_set_nodelay(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| "Invalid boolean value: expected boolean".to_string())?;
 
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.set_nodelay(enabled)
         .map_err(|e| format!("Failed to set nodelay: {}", e))?;
@@ -493,9 +623,15 @@ pub fn socket_shutdown(args: &[Value]) -> Result<Value, String> {
     }
 
     let socket_ptr = extract_socket_ptr(&args[0])?;
-
     let handle = unsafe { &*(socket_ptr as *const TcpSocketHandle) };
-    let stream = handle.stream.lock();
+
+    if *handle.closed.lock() {
+        return Err("Socket is closed".to_string());
+    }
+
+    let stream_opt = handle.stream.lock();
+    let stream = stream_opt.as_ref()
+        .ok_or_else(|| "Socket is closed".to_string())?;
 
     stream.shutdown(Shutdown::Write)
         .map_err(|e| format!("Failed to shutdown: {}", e))?;
@@ -517,12 +653,20 @@ pub fn listener_accept(args: &[Value]) -> Result<Value, String> {
     let listener_ptr = extract_listener_ptr(&args[0])?;
     let handle = unsafe { &*(listener_ptr as *const TcpListenerHandle) };
 
-    let listener = handle.listener.lock();
+    if *handle.closed.lock() {
+        return Err("Listener is closed".to_string());
+    }
+
+    let listener_opt = handle.listener.lock();
+    let listener = listener_opt.as_ref()
+        .ok_or_else(|| "Listener is closed".to_string())?;
+
     let (stream, _) = listener.accept()
         .map_err(|e| format!("Accept failed: {}", e))?;
 
     let socket_handle = Box::new(TcpSocketHandle {
-        stream: Arc::new(Mutex::new(stream))
+        stream: Arc::new(Mutex::new(Some(stream))),
+        closed: Arc::new(Mutex::new(false)),
     });
     let ptr = Box::into_raw(socket_handle) as u64;
 
@@ -536,10 +680,21 @@ pub fn listener_close(args: &[Value]) -> Result<Value, String> {
     }
 
     let listener_ptr = extract_listener_ptr(&args[0])?;
+    let handle = unsafe { &*(listener_ptr as *const TcpListenerHandle) };
 
-    // 释放资源
-    let _handle = unsafe { Box::from_raw(listener_ptr as *mut TcpListenerHandle) };
-    // Box被drop时会自动关闭listener
+    let mut closed = handle.closed.lock();
+    if *closed {
+        // 已经关闭，直接返回（防止双重释放）
+        return Ok(Value::null());
+    }
+
+    // 标记为已关闭
+    *closed = true;
+
+    // 关闭listener
+    if let Some(listener) = handle.listener.lock().take() {
+        drop(listener);  // 显式关闭TCP listener
+    }
 
     Ok(Value::null())
 }
